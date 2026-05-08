@@ -1,0 +1,532 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------
+// Auth
+// ----------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  STAFF
+}
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  name         String?
+  role         UserRole  @default(STAFF)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  auditLogs AuditLog[]
+
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------
+// Catalog
+// ----------------------------------------------------------------------
+
+model Category {
+  id          String    @id @default(uuid())
+  name        String    @unique
+  description String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  products Product[]
+
+  @@map("categories")
+}
+
+enum ProductUnit {
+  kg
+  piece
+  pcs
+  sack
+  crate
+  litre
+  bundle
+}
+
+enum EntityStatus {
+  Active
+  Inactive
+}
+
+model Product {
+  id         String       @id // canonical prefixed id, e.g. "PRD-001"
+  name       String
+  categoryId String
+  unit       ProductUnit
+  buyPrice   Int          @default(0) // auto-updated from latest Purchase effectiveBuyPrice
+  sellPrice  Int          @default(0) // set by user via Purchase sell price
+  stock      Int          @default(0)
+  status     EntityStatus @default(Active)
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  deletedAt  DateTime?
+
+  category          Category           @relation(fields: [categoryId], references: [id])
+  stockEntries      StockEntry[]
+  distributionLines DistributionLine[]
+  saleItems         SaleItem[]
+  invoiceItems      InvoiceItem[]
+  stockAdjustments  StockAdjustment[]
+  purchases         Purchase[]
+
+  @@index([name])
+  @@index([categoryId])
+  @@map("products")
+}
+
+// ----------------------------------------------------------------------
+// Vans
+// ----------------------------------------------------------------------
+
+model Van {
+  id        String    @id // "V1"
+  vanName   String
+  driver    String
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  distributions    Distribution[]
+  sales            Sale[]
+  invoices         Invoice[]
+  expenses         Expense[]
+  stockAdjustments StockAdjustment[]
+
+  @@map("vans")
+}
+
+// ----------------------------------------------------------------------
+// Stock Entries
+// ----------------------------------------------------------------------
+
+model StockEntry {
+  id                String    @id // "STK-992"
+  date              DateTime  @db.Date
+  productId         String
+  quantity          Int
+  remainingQuantity Int       // FIFO lot balance; decremented by distribution allocate + warehouse adjustment
+  expiryDate        DateTime? @db.Date
+  buyingRate        Int
+  source            String
+  notes             String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  product     Product              @relation(fields: [productId], references: [id])
+  allocations StockLotAllocation[]
+
+  @@index([productId])
+  @@index([date])
+  @@index([productId, remainingQuantity])
+  @@map("stock_entries")
+}
+
+// ----------------------------------------------------------------------
+// Stock Lot Allocations (lot-level FIFO ledger)
+// ----------------------------------------------------------------------
+
+enum StockLotConsumerType {
+  DISTRIBUTION_LINE
+  SALE_ITEM
+  STOCK_ADJUSTMENT
+}
+
+// One row = "quantity taken from stockEntryId (FIFO source) by consumerType/consumerId".
+// - parentAllocationId null: consumed directly from warehouse StockEntry.
+// - parentAllocationId set : sub-consumed from a prior allocation (e.g. sale from a
+//   distribution-line allocation sitting on a van). Parent's remainingQuantity
+//   decrements when a child is created, returns to warehouse on reversal.
+// remainingQuantity: only meaningful for DISTRIBUTION_LINE rows (van-side lot balance).
+// unitCost: snapshot of StockEntry.buyingRate at consumption time (COGS basis).
+model StockLotAllocation {
+  id                 String               @id @default(uuid())
+  stockEntryId       String
+  parentAllocationId String?
+  consumerType       StockLotConsumerType
+  consumerId         String
+  quantity           Int
+  remainingQuantity  Int                  @default(0)
+  unitCost           Int
+  createdAt          DateTime             @default(now())
+
+  stockEntry StockEntry           @relation(fields: [stockEntryId], references: [id])
+  parent     StockLotAllocation?  @relation("SubAllocation", fields: [parentAllocationId], references: [id])
+  children   StockLotAllocation[] @relation("SubAllocation")
+
+  @@index([consumerType, consumerId])
+  @@index([parentAllocationId])
+  @@index([stockEntryId])
+  @@map("stock_lot_allocations")
+}
+
+// ----------------------------------------------------------------------
+// Stock Adjustments (damage / wastage / correction)
+// ----------------------------------------------------------------------
+
+enum StockAdjustmentReason {
+  DAMAGE
+  WASTAGE
+  CORRECTION
+}
+
+enum StockLocation {
+  WAREHOUSE
+  VAN
+}
+
+model StockAdjustment {
+  id        String                @id // "ADJ-001"
+  date      DateTime              @db.Date
+  productId String
+  quantity  Int                   // positive; positive = decrease, negative = increase (CORRECTION only)
+  reason    StockAdjustmentReason
+  location  StockLocation
+  vanId     String?
+  notes     String?
+  createdAt DateTime              @default(now())
+  updatedAt DateTime              @updatedAt
+  deletedAt DateTime?
+
+  product Product @relation(fields: [productId], references: [id])
+  van     Van?    @relation(fields: [vanId], references: [id])
+
+  @@index([productId])
+  @@index([date])
+  @@index([reason])
+  @@map("stock_adjustments")
+}
+
+// ----------------------------------------------------------------------
+// Distribution
+// ----------------------------------------------------------------------
+
+model Distribution {
+  id        String    @id // "DST-001"
+  vanId     String
+  date      DateTime  @db.Date
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  van   Van                @relation(fields: [vanId], references: [id])
+  lines DistributionLine[]
+
+  @@unique([vanId, date])
+  @@index([date])
+  @@map("distributions")
+}
+
+model DistributionLine {
+  id             String   @id @default(uuid())
+  distributionId String
+  productId      String
+  allocated      Int
+  returned       Int      @default(0) // normal return → goes back to warehouse stock
+  damageReturned Int      @default(0) // damaged return → counted as loss/wastage
+
+  distribution Distribution @relation(fields: [distributionId], references: [id], onDelete: Cascade)
+  product      Product      @relation(fields: [productId], references: [id])
+
+  @@unique([distributionId, productId])
+  @@map("distribution_lines")
+}
+
+// ----------------------------------------------------------------------
+// Sales + Invoices
+// ----------------------------------------------------------------------
+
+enum InvoiceStatus {
+  unpaid
+  paid
+}
+
+model Sale {
+  id        String    @id // "SAL-001"
+  vanId     String
+  date      DateTime  @db.Date
+  total     Int
+  invoiceId String?   @unique
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  van     Van        @relation(fields: [vanId], references: [id])
+  items   SaleItem[]
+  invoice Invoice?   @relation(fields: [invoiceId], references: [id])
+
+  @@index([vanId, date])
+  @@map("sales")
+}
+
+model SaleItem {
+  id        String @id @default(uuid())
+  saleId    String
+  productId String
+  price     Int
+  qty       Int
+
+  sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("sale_items")
+}
+
+model Invoice {
+  id        String        @id // "INV-1024"
+  vanId     String
+  date      DateTime      @db.Date
+  total     Int
+  status    InvoiceStatus @default(unpaid)
+  paidAt    DateTime?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  deletedAt DateTime?
+
+  van   Van           @relation(fields: [vanId], references: [id])
+  items InvoiceItem[]
+  sale  Sale?
+
+  @@index([status])
+  @@index([date])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id        String @id @default(uuid())
+  invoiceId String
+  productId String
+  name      String
+  price     Int
+  qty       Int
+  subtotal  Int
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("invoice_items")
+}
+
+// ----------------------------------------------------------------------
+// Expenses
+// ----------------------------------------------------------------------
+
+enum ExpenseStatus {
+  paid
+  pending
+}
+
+model Expense {
+  id          String          @id // "EXP-001"
+  date        DateTime        @db.Date
+  category    String          // "Fuel" | "Van Rent" | "Labor Cost" | "Shipping Cost" | "Market Fees"
+  amount      Int
+  description String
+  status      ExpenseStatus   @default(pending)
+  vanId       String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  deletedAt   DateTime?
+
+  van Van? @relation(fields: [vanId], references: [id])
+
+  @@index([date])
+  @@index([category])
+  @@index([status])
+  @@map("expenses")
+}
+
+// ----------------------------------------------------------------------
+// Activity feed
+// ----------------------------------------------------------------------
+
+enum TransactionType {
+  sale
+  expense
+  stock
+  purchase
+  bank_deposit
+  bank_withdrawal
+}
+
+model Transaction {
+  id          String          @id @default(uuid())
+  occurredAt  DateTime
+  amount      Int
+  type        TransactionType
+  description String
+  refTable    String?
+  refId       String?
+
+  @@index([occurredAt])
+  @@index([type])
+  @@map("transactions")
+}
+
+// ----------------------------------------------------------------------
+// Purchase & Shipment (cost calculation for buy/sell price)
+// ----------------------------------------------------------------------
+
+enum PurchaseStatus {
+  draft
+  confirmed
+}
+
+model Shipment {
+  id            String         @id // "SHP-001"
+  date          DateTime       @db.Date
+  transportCost Int            @default(0) // total truck transport cost
+  labourCost    Int            @default(0) // total truck labour cost
+  otherCost     Int            @default(0) // other overheads for the whole truck
+  totalAmount   Int            @default(0) // calculated: sum(purchases) + overheads
+  source        String         // supplier / market
+  notes         String?
+  status        PurchaseStatus @default(confirmed)
+  bankAccountId String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  deletedAt     DateTime?
+
+  purchases   Purchase[]
+  bankAccount BankAccount? @relation(fields: [bankAccountId], references: [id])
+
+  @@index([date])
+  @@map("shipments")
+}
+
+model Purchase {
+  id                String         @id // "PUR-001"
+  shipmentId        String?        // optional: link to a shipment/truck
+  date              DateTime       @db.Date
+  productId         String
+  quantity          Int            // total quantity purchased
+  basePrice         Int            // base price per unit (BDT)
+  transportCost     Int            @default(0) // allocated share from shipment or manual
+  labourCost        Int            @default(0) // allocated share from shipment or manual
+  otherCost         Int            @default(0) // allocated share from shipment or manual
+  effectiveBuyPrice Int            // calculated: (basePrice * qty + all costs) / qty → per unit
+  sellPrice         Int            @default(0) // sell price set by user
+  profitPercent     Int?           // optional profit % used to suggest sell price
+  source            String         // supplier / source name
+  notes             String?
+  status            PurchaseStatus @default(confirmed)
+  bankAccountId     String?        // optional: deducted from bank account (if not part of shipment)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  deletedAt         DateTime?
+
+  product     Product      @relation(fields: [productId], references: [id])
+  bankAccount BankAccount? @relation(fields: [bankAccountId], references: [id])
+  shipment    Shipment?    @relation(fields: [shipmentId], references: [id])
+
+  @@index([productId])
+  @@index([date])
+  @@index([shipmentId])
+  @@map("purchases")
+}
+
+// ----------------------------------------------------------------------
+// Banking
+// ----------------------------------------------------------------------
+
+enum BankTransactionType {
+  deposit
+  withdrawal
+}
+
+model BankAccount {
+  id            String       @id @default(uuid())
+  bankName      String
+  accountNumber String
+  accountHolder String?
+  balance       Int          @default(0) // current balance in BDT
+  isActive      Boolean      @default(true)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  transactions BankTransaction[]
+  purchases    Purchase[]
+  shipments    Shipment[]
+
+  @@map("bank_accounts")
+}
+
+model BankTransaction {
+  id            String               @id @default(uuid())
+  bankAccountId String
+  type          BankTransactionType
+  amount        Int                  // positive integer (BDT)
+  description   String?
+  reference     String?              // cheque no, transfer ref, etc.
+  occurredAt    DateTime
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  bankAccount BankAccount @relation(fields: [bankAccountId], references: [id])
+
+  @@index([bankAccountId])
+  @@index([occurredAt])
+  @@map("bank_transactions")
+}
+
+// ----------------------------------------------------------------------
+// Audit log
+// ----------------------------------------------------------------------
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  RESTORE
+  LOGIN
+}
+
+model AuditLog {
+  id         String      @id @default(uuid())
+  occurredAt DateTime    @default(now())
+  userId     String?
+  action     AuditAction
+  entity     String
+  entityId   String
+  before     Json?
+  after      Json?
+  meta       Json?
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([occurredAt])
+  @@map("audit_logs")
+}
+
+// ----------------------------------------------------------------------
+// Prefix-id sequence
+// ----------------------------------------------------------------------
+
+model IdSequence {
+  prefix String @id
+  next   Int    @default(1)
+  width  Int    @default(3)
+
+  @@map("id_sequences")
+}

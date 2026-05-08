@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r 'PrismaService\\\\|prisma\\\\.$transaction\\\\|findMany\\\\|findFirst\\\\|aggregate\\\\|update\\\\|create' /Users/a/Documents/Syed/ghm-server/src '--include=*.ts')",
+      "Bash(npx tsc *)",
+      "Bash(grep *)",
+      "Bash(npx jest *)",
+      "Bash(curl *)"
+    ]
+  }
+}
