@@ -19,6 +19,7 @@ export class InvoicesService {
             OR: [
               { id: { contains: q.q.toUpperCase() } },
               { van: { vanName: { contains: q.q, mode: 'insensitive' } } },
+              { customer: { name: { contains: q.q, mode: 'insensitive' } } },
               { vanId: { contains: q.q.toUpperCase() } },
             ],
           }
@@ -31,15 +32,21 @@ export class InvoicesService {
         orderBy,
         skip: q.skip,
         take: q.take,
-        include: { van: { select: { vanName: true } }, _count: { select: { items: true } } },
+        include: {
+          van: { select: { vanName: true } },
+          customer: { select: { name: true, type: true } },
+          _count: { select: { items: true } },
+        },
       }),
       this.prisma.invoice.count({ where }),
     ]);
     const data = rows.map((r) => ({
       id: r.id,
       date: r.date.toISOString().slice(0, 10),
-      van: r.van.vanName,
+      van: r.van?.vanName ?? null,
       vanId: r.vanId,
+      customer: r.customer?.name ?? null,
+      customerId: r.customerId,
       items: r._count.items,
       total: r.total,
       status: r.status,
@@ -50,9 +57,15 @@ export class InvoicesService {
   async findOne(id: string) {
     const inv = await this.prisma.invoice.findFirst({
       where: { id, deletedAt: null },
-      include: { van: true, items: true },
+      include: {
+        van: true,
+        customer: true,
+        items: { include: { product: { select: { unit: true } } } },
+        sale: { select: { id: true } },
+      },
     });
-    if (!inv) throw new NotFoundException({ code: 'NOT_FOUND', message: `Invoice ${id} not found` });
+    if (!inv)
+      throw new NotFoundException({ code: 'NOT_FOUND', message: `Invoice ${id} not found` });
     return inv;
   }
 
@@ -70,7 +83,7 @@ export class InvoicesService {
         ...(dto.status ? { status: dto.status } : {}),
         ...(dto.status === 'paid' ? { paidAt: new Date() } : {}),
       },
-      include: { van: true, items: true },
+      include: { van: true, customer: true, items: true },
     });
   }
 
@@ -82,14 +95,16 @@ export class InvoicesService {
     const rows = await this.prisma.invoice.findMany({
       where,
       orderBy: { date: 'desc' },
-      include: { van: true, _count: { select: { items: true } } },
+      include: { van: true, customer: true, _count: { select: { items: true } } },
     });
     return csvStringify(
       rows.map((r) => ({
         id: r.id,
         date: r.date.toISOString().slice(0, 10),
         vanId: r.vanId,
-        van: r.van.vanName,
+        van: r.van?.vanName ?? '',
+        customerId: r.customerId,
+        customer: r.customer?.name ?? '',
         items: r._count.items,
         total: r.total,
         status: r.status,

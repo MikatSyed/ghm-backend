@@ -10,6 +10,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { CreateDirectSaleDto } from './dto/create-direct-sale.dto';
 import { CreateSaleDto } from './dto/create-sale.dto';
 import { ListSalesQueryDto } from './dto/list-sales.query';
 import { SalesService } from './sales.service';
@@ -24,6 +25,14 @@ export class SalesController {
   @ApiOperation({ summary: 'Finalize sale cycle → create invoice + record revenue' })
   finalize(@Body() dto: CreateSaleDto) {
     return this.service.finalize(dto);
+  }
+
+  @Post('direct')
+  @ApiOperation({
+    summary: 'Direct warehouse→customer sale (no van): invoice + stock reduction immediately',
+  })
+  direct(@Body() dto: CreateDirectSaleDto) {
+    return this.service.direct(dto);
   }
 
   @Get()

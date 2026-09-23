@@ -1,53 +1,14 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsDateString, IsInt, IsOptional, IsString, IsUUID, MaxLength, Min } from 'class-validator';
+import { IsDateString, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 
+// Editing a purchase only updates header fields. Line edits are not supported
+// because StockEntry/StockBatch state has already been written based on the
+// original lines — changing them after the fact would desync stock/COGS.
 export class UpdatePurchaseDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsDateString()
   date?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(1)
-  quantity?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  basePrice?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  transportCost?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  labourCost?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  otherCost?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  sellPrice?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  profitPercent?: number;
 
   @ApiPropertyOptional()
   @IsOptional()

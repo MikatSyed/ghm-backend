@@ -1,12 +1,16 @@
 import * as Joi from 'joi';
 
 export const envValidationSchema = Joi.object({
-  NODE_ENV: Joi.string().valid('development', 'production', 'test', 'staging').default('development'),
+  NODE_ENV: Joi.string()
+    .valid('development', 'production', 'test', 'staging')
+    .default('development'),
   PORT: Joi.number().default(3000),
   API_PREFIX: Joi.string().default('api'),
   API_VERSION: Joi.string().default('1'),
 
-  DATABASE_URL: Joi.string().uri({ scheme: ['postgres', 'postgresql'] }).required(),
+  DATABASE_URL: Joi.string()
+    .uri({ scheme: ['postgres', 'postgresql'] })
+    .required(),
 
   CORS_ORIGINS: Joi.string().default('*'),
 
@@ -18,7 +22,9 @@ export const envValidationSchema = Joi.object({
   THROTTLE_TTL: Joi.number().default(60),
   THROTTLE_LIMIT: Joi.number().default(100),
 
-  LOG_LEVEL: Joi.string().valid('error', 'warn', 'info', 'http', 'debug', 'verbose').default('info'),
+  LOG_LEVEL: Joi.string()
+    .valid('error', 'warn', 'info', 'http', 'debug', 'verbose')
+    .default('info'),
 
   SWAGGER_ENABLED: Joi.boolean().truthy('true').falsy('false').default(true),
   SWAGGER_PATH: Joi.string().default('docs'),

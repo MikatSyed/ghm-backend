@@ -503,4 +503,3 @@ Defaults: `100 req / 60s` per IP (`429 TOO_MANY_REQUESTS`). Tunable via `THROTTL
 - **Stock didn't decrement?** Make sure you called `POST /sales` (which finalizes) or `POST /distributions` — both are atomic, both can return `409 INSUFFICIENT_STOCK`.
 - **Paid invoice won't update?** That's by design; only status flips *to* `paid` are allowed once paid.
 - **Date filtering off by a day?** Send `YYYY-MM-DD` (Dhaka calendar). The server handles timezone conversion.
-# ghm-backend

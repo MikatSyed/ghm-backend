@@ -1,5 +1,5 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsInt, IsString, Min } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsInt, IsOptional, IsString, Min } from 'class-validator';
 
 export class AddDistributionLineDto {
   @ApiProperty({ example: 'PRD-001' })
@@ -10,4 +10,20 @@ export class AddDistributionLineDto {
   @IsInt()
   @Min(1)
   allocated!: number;
+
+  @ApiPropertyOptional({
+    example: 'BAT-007',
+    description: 'Restrict FIFO allocation to this batch',
+  })
+  @IsOptional()
+  @IsString()
+  batchId?: string;
+
+  @ApiPropertyOptional({
+    example: 'STK-011',
+    description: 'Restrict allocation to this exact stock lot',
+  })
+  @IsOptional()
+  @IsString()
+  stockEntryId?: string;
 }

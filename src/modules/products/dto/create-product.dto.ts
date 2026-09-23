@@ -16,17 +16,29 @@ export class CreateProductDto {
   @IsEnum(ProductUnit)
   unit!: ProductUnit;
 
-  @ApiPropertyOptional({ description: 'BDT integer — managed via Purchase module', default: 0 })
+  @ApiPropertyOptional({ description: 'BDT integer — managed via Stock Entry', default: 0 })
   @IsOptional()
   @IsInt()
   @Min(0)
-  buyPrice?: number;
+  basePrice?: number;
 
-  @ApiPropertyOptional({ description: 'BDT integer — managed via Purchase module', default: 0 })
+  @ApiPropertyOptional({ description: 'BDT integer — managed via Stock Entry', default: 0 })
   @IsOptional()
   @IsInt()
   @Min(0)
-  sellPrice?: number;
+  listPrice?: number;
+
+  @ApiPropertyOptional({ description: 'BDT integer — managed via Stock Entry', default: 0 })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  tradePrice?: number;
+
+  @ApiPropertyOptional({ description: 'BDT integer — managed via Stock Entry', default: 0 })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  mrp?: number;
 
   @ApiPropertyOptional({ enum: EntityStatus, default: EntityStatus.Active })
   @IsOptional()

@@ -1,4 +1,9 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { AuditAction, Prisma } from '@prisma/client';
 import { listResponse, ListResponse } from '../../common/dto/pagination.dto';
 import { PrefixIdService } from '../../common/services/prefix-id.service';
@@ -7,11 +12,14 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { ListProductsQueryDto } from './dto/list-products.query';
 import { UpdateProductDto } from './dto/update-product.dto';
 
-const SORTABLE = ['name', 'sellPrice', 'buyPrice', 'stock', 'createdAt'] as const;
+const SORTABLE = ['name', 'tradePrice', 'basePrice', 'stock', 'createdAt'] as const;
 
 @Injectable()
 export class ProductsService {
-  constructor(private readonly prisma: PrismaService, private readonly ids: PrefixIdService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ids: PrefixIdService,
+  ) {}
 
   async create(dto: CreateProductDto) {
     await this.assertCategory(dto.categoryId);
@@ -38,12 +46,23 @@ export class ProductsService {
       ...(q.categoryId ? { categoryId: q.categoryId } : {}),
       ...(q.status ? { status: q.status } : {}),
       ...(q.q
-        ? { OR: [{ name: { contains: q.q, mode: 'insensitive' } }, { id: { contains: q.q.toUpperCase() } }] }
+        ? {
+            OR: [
+              { name: { contains: q.q, mode: 'insensitive' } },
+              { id: { contains: q.q.toUpperCase() } },
+            ],
+          }
         : {}),
     };
     const orderBy = q.parseSort(SORTABLE) ?? { createdAt: 'desc' };
     const [items, total] = await Promise.all([
-      this.prisma.product.findMany({ where, orderBy, skip: q.skip, take: q.take, include: { category: true } }),
+      this.prisma.product.findMany({
+        where,
+        orderBy,
+        skip: q.skip,
+        take: q.take,
+        include: { category: true },
+      }),
       this.prisma.product.count({ where }),
     ]);
     return listResponse(items, total, q);
@@ -128,36 +147,38 @@ export class ProductsService {
 
   async history(id: string) {
     await this.findOne(id);
-    const [stockEntries, stockAdjustments, distributionLines, saleItems, audit] = await Promise.all([
-      this.prisma.stockEntry.findMany({
-        where: { productId: id, deletedAt: null },
-        orderBy: { date: 'desc' },
-        take: 100,
-      }),
-      this.prisma.stockAdjustment.findMany({
-        where: { productId: id, deletedAt: null },
-        orderBy: { date: 'desc' },
-        take: 100,
-        include: { van: { select: { vanName: true } } },
-      }),
-      this.prisma.distributionLine.findMany({
-        where: { productId: id },
-        include: { distribution: { select: { id: true, date: true, vanId: true } } },
-        orderBy: { distribution: { date: 'desc' } },
-        take: 100,
-      }),
-      this.prisma.saleItem.findMany({
-        where: { productId: id },
-        include: { sale: { select: { id: true, date: true, vanId: true } } },
-        orderBy: { sale: { date: 'desc' } },
-        take: 100,
-      }),
-      this.prisma.auditLog.findMany({
-        where: { entity: 'Product', entityId: id },
-        orderBy: { occurredAt: 'desc' },
-        take: 100,
-      }),
-    ]);
+    const [stockEntries, stockAdjustments, distributionLines, saleItems, audit] = await Promise.all(
+      [
+        this.prisma.stockEntry.findMany({
+          where: { productId: id, deletedAt: null },
+          orderBy: { date: 'desc' },
+          take: 100,
+        }),
+        this.prisma.stockAdjustment.findMany({
+          where: { productId: id, deletedAt: null },
+          orderBy: { date: 'desc' },
+          take: 100,
+          include: { van: { select: { vanName: true } } },
+        }),
+        this.prisma.distributionLine.findMany({
+          where: { productId: id },
+          include: { distribution: { select: { id: true, date: true, vanId: true } } },
+          orderBy: { distribution: { date: 'desc' } },
+          take: 100,
+        }),
+        this.prisma.saleItem.findMany({
+          where: { productId: id },
+          include: { sale: { select: { id: true, date: true, vanId: true } } },
+          orderBy: { sale: { date: 'desc' } },
+          take: 100,
+        }),
+        this.prisma.auditLog.findMany({
+          where: { entity: 'Product', entityId: id },
+          orderBy: { occurredAt: 'desc' },
+          take: 100,
+        }),
+      ],
+    );
     return { stockEntries, stockAdjustments, distributionLines, saleItems, audit };
   }
 

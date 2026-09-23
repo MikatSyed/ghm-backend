@@ -1,0 +1,9 @@
+dist
+logs
+coverage
+test-results
+perf
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

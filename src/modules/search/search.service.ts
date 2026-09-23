@@ -26,8 +26,10 @@ export class SearchService {
     const tasks: Array<Promise<Row[]>> = [];
     if (kind === 'all' || kind === 'sales') tasks.push(this.searchSales(search, q.vanId, dateGte));
     if (kind === 'all' || kind === 'stock') tasks.push(this.searchStock(search, dateGte));
-    if (kind === 'all' || kind === 'expenses') tasks.push(this.searchExpenses(search, q.category, q.vanId, dateGte));
-    if (kind === 'all' || kind === 'returns') tasks.push(this.searchReturns(search, q.vanId, dateGte));
+    if (kind === 'all' || kind === 'expenses')
+      tasks.push(this.searchExpenses(search, q.category, q.vanId, dateGte));
+    if (kind === 'all' || kind === 'returns')
+      tasks.push(this.searchReturns(search, q.vanId, dateGte));
 
     const all = (await Promise.all(tasks)).flat();
     all.sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -37,7 +39,11 @@ export class SearchService {
     return listResponse(page, total, q);
   }
 
-  private async searchSales(qStr: string | undefined, vanId: string | undefined, gte?: Date): Promise<Row[]> {
+  private async searchSales(
+    qStr: string | undefined,
+    vanId: string | undefined,
+    gte?: Date,
+  ): Promise<Row[]> {
     const rows = await this.prisma.invoice.findMany({
       where: {
         deletedAt: null,
@@ -48,11 +54,12 @@ export class SearchService {
               OR: [
                 { id: { contains: qStr.toUpperCase() } },
                 { van: { vanName: { contains: qStr, mode: 'insensitive' } } },
+                { customer: { name: { contains: qStr, mode: 'insensitive' } } },
               ],
             }
           : {}),
       },
-      include: { van: { select: { vanName: true } } },
+      include: { van: { select: { vanName: true } }, customer: { select: { name: true } } },
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
@@ -62,7 +69,7 @@ export class SearchService {
       title: `Invoice ${r.id}`,
       amount: r.total,
       date: r.date.toISOString().slice(0, 10),
-      van: r.van.vanName,
+      van: r.van?.vanName ?? r.customer?.name ?? '',
       status: r.status === 'paid' ? 'completed' : 'pending',
       category: 'Sales',
     }));
@@ -91,7 +98,7 @@ export class SearchService {
       id: r.id,
       type: 'stock' as const,
       title: `${r.product.name} from ${r.source}`,
-      amount: r.quantity * r.buyingRate,
+      amount: r.quantity * r.basePrice,
       date: r.date.toISOString().slice(0, 10),
       van: '',
       status: 'stored',
@@ -135,7 +142,11 @@ export class SearchService {
     }));
   }
 
-  private async searchReturns(qStr: string | undefined, vanId: string | undefined, gte?: Date): Promise<Row[]> {
+  private async searchReturns(
+    qStr: string | undefined,
+    vanId: string | undefined,
+    gte?: Date,
+  ): Promise<Row[]> {
     const lines = await this.prisma.distributionLine.findMany({
       where: {
         returned: { gt: 0 },

@@ -1,28 +1,39 @@
-import {
-  BadRequestException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
-import { AuditAction, Prisma, TransactionType } from '@prisma/client';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { AuditAction, Prisma, StockCondition, TransactionType } from '@prisma/client';
 import { listResponse, ListResponse } from '../../common/dto/pagination.dto';
 import { parseDhakaDateOnly } from '../../common/util/dhaka-time';
 import { PrefixIdService } from '../../common/services/prefix-id.service';
+import { StockLotService } from '../../common/services/stock-lot.service';
 import { PrismaService } from '../../prisma/prisma.service';
-import { CreatePurchaseDto } from './dto/create-purchase.dto';
+import { CreatePurchaseDto, PurchaseLineDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { ListPurchasesQueryDto } from './dto/list-purchases.query';
+
+interface ComputedLine {
+  productId: string;
+  quantity: number;
+  basePrice: number;
+  transportCost: number;
+  labourCost: number;
+  otherCost: number;
+  effectiveBuyPrice: number;
+  sellPrice: number;
+  profitPercent?: number;
+  condition: StockCondition;
+  lineTotal: number;
+}
 
 @Injectable()
 export class PurchasesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ids: PrefixIdService,
+    private readonly lots: StockLotService,
   ) {}
 
   /**
-   * Calculate effectiveBuyPrice (cost per unit):
-   *   (basePrice * qty + transportCost + labourCost + otherCost) / qty
-   * Rounded to nearest integer.
+   * effectiveBuyPrice (cost per unit):
+   *   (basePrice * qty + transport + labour + other) / qty, rounded.
    */
   private calcEffectiveBuyPrice(
     basePrice: number,
@@ -35,144 +46,217 @@ export class PurchasesService {
     return Math.round(totalCost / qty);
   }
 
-  /**
-   * Calculate sell price from effective buy price + profit percent.
-   */
   private calcSellPrice(effectiveBuyPrice: number, profitPercent: number): number {
     return Math.round(effectiveBuyPrice * (1 + profitPercent / 100));
   }
 
-  async create(dto: CreatePurchaseDto) {
-    const date = parseDhakaDateOnly(dto.date);
-    const transportCost = dto.transportCost ?? 0;
-    const labourCost = dto.labourCost ?? 0;
-    const otherCost = dto.otherCost ?? 0;
-
+  private computeLine(line: PurchaseLineDto): ComputedLine {
+    const transportCost = line.transportCost ?? 0;
+    const labourCost = line.labourCost ?? 0;
+    const otherCost = line.otherCost ?? 0;
     const effectiveBuyPrice = this.calcEffectiveBuyPrice(
-      dto.basePrice,
-      dto.quantity,
+      line.basePrice,
+      line.quantity,
       transportCost,
       labourCost,
       otherCost,
     );
 
-    let sellPrice = dto.sellPrice ?? 0;
-    let profitPercent = dto.profitPercent;
+    let sellPrice = line.sellPrice ?? 0;
+    let profitPercent = line.profitPercent;
 
-    // If profitPercent is given but sellPrice isn't, auto-calculate sell price
-    if (profitPercent !== undefined && !dto.sellPrice) {
+    if (profitPercent !== undefined && !line.sellPrice) {
       sellPrice = this.calcSellPrice(effectiveBuyPrice, profitPercent);
     }
-    // If sellPrice is given without profitPercent, compute it for record
-    if (dto.sellPrice && profitPercent === undefined) {
-      profitPercent = Math.round(((dto.sellPrice - effectiveBuyPrice) / effectiveBuyPrice) * 100);
+    if (line.sellPrice && profitPercent === undefined && effectiveBuyPrice > 0) {
+      profitPercent = Math.round(((line.sellPrice - effectiveBuyPrice) / effectiveBuyPrice) * 100);
     }
 
-    // Validate bank account if provided
-    if (dto.bankAccountId) {
-      const bank = await this.prisma.bankAccount.findFirst({
-        where: { id: dto.bankAccountId, deletedAt: null },
-      });
-      if (!bank) {
-        throw new BadRequestException({
-          code: 'INVALID_BANK_ACCOUNT',
-          message: `Bank account ${dto.bankAccountId} not found`,
+    const lineTotal = line.basePrice * line.quantity + transportCost + labourCost + otherCost;
+
+    return {
+      productId: line.productId,
+      quantity: line.quantity,
+      basePrice: line.basePrice,
+      transportCost,
+      labourCost,
+      otherCost,
+      effectiveBuyPrice,
+      sellPrice,
+      profitPercent,
+      condition: line.condition ?? StockCondition.FRESH,
+      lineTotal,
+    };
+  }
+
+  async create(dto: CreatePurchaseDto) {
+    const date = parseDhakaDateOnly(dto.date);
+    const computedLines = dto.lines.map((l) => this.computeLine(l));
+    const total = computedLines.reduce((s, l) => s + l.lineTotal, 0);
+
+    return this.prisma.$transaction(
+      async (tx) => {
+        // Validate every product exists
+        const productIds = Array.from(new Set(computedLines.map((l) => l.productId)));
+        const products = await tx.product.findMany({
+          where: { id: { in: productIds }, deletedAt: null },
+          select: { id: true, name: true, unit: true },
         });
-      }
-    }
+        if (products.length !== productIds.length) {
+          const known = new Set(products.map((p) => p.id));
+          const missing = productIds.filter((id) => !known.has(id));
+          throw new BadRequestException({
+            code: 'INVALID_PRODUCT',
+            message: `Unknown product(s): ${missing.join(', ')}`,
+            fields: { productId: missing },
+          });
+        }
+        const productMap = new Map(products.map((p) => [p.id, p]));
 
-    return this.prisma.$transaction(async (tx) => {
-      // Validate product
-      const product = await tx.product.findFirst({
-        where: { id: dto.productId, deletedAt: null },
-      });
-      if (!product) {
-        throw new BadRequestException({
-          code: 'INVALID_PRODUCT',
-          message: `Product ${dto.productId} not found`,
-        });
-      }
+        const purchaseId = await this.ids.next('PUR', 3, tx);
 
-      const id = await this.ids.next('PUR', 3, tx);
-      const purchase = await tx.purchase.create({
-        data: {
-          id,
-          date,
-          productId: dto.productId,
-          quantity: dto.quantity,
-          basePrice: dto.basePrice,
-          transportCost,
-          labourCost,
-          otherCost,
-          effectiveBuyPrice,
-          sellPrice,
-          profitPercent,
-          source: dto.source,
-          notes: dto.notes,
-          bankAccountId: dto.bankAccountId,
-          status: 'confirmed',
-        },
-        include: { product: { select: { name: true, unit: true } }, bankAccount: true },
-      });
-
-      // Update product's buyPrice and sellPrice from this purchase
-      await tx.product.update({
-        where: { id: dto.productId },
-        data: {
-          buyPrice: effectiveBuyPrice,
-          ...(sellPrice > 0 ? { sellPrice } : {}),
-        },
-      });
-
-      // Deduct from bank account if provided
-      const totalPurchaseAmount = dto.basePrice * dto.quantity + transportCost + labourCost + otherCost;
-      if (dto.bankAccountId) {
-        await tx.bankAccount.update({
-          where: { id: dto.bankAccountId },
-          data: { balance: { decrement: totalPurchaseAmount } },
-        });
-        await tx.bankTransaction.create({
+        // One batch covers the whole purchase — multi-product receiving event.
+        const batchId = await this.ids.next('BAT', 3, tx);
+        await tx.stockBatch.create({
           data: {
-            bankAccountId: dto.bankAccountId,
-            type: 'withdrawal',
-            amount: totalPurchaseAmount,
-            description: `Purchase: ${product.name} x${dto.quantity} ${product.unit} (${id})`,
-            reference: id,
-            occurredAt: date,
+            id: batchId,
+            date,
+            source: dto.source,
+            notes: dto.notes,
           },
         });
-      }
 
-      // Create a Transaction record for activity feed
-      await tx.transaction.create({
-        data: {
-          occurredAt: date,
-          amount: totalPurchaseAmount,
-          type: TransactionType.purchase,
-          description: `Purchase: ${product.name} x${dto.quantity} ${product.unit} from ${dto.source}`,
-          refTable: 'purchases',
-          refId: id,
-        },
-      });
+        // Per line: stock entry + product price/stock update.
+        // Only FRESH lines update Product.basePrice/tradePrice — a damaged
+        // discount must not poison the global product price.
+        for (const line of computedLines) {
+          const product = productMap.get(line.productId)!;
+          const stockEntryId = await this.ids.next('STK', 3, tx);
+          await tx.stockEntry.create({
+            data: {
+              id: stockEntryId,
+              date,
+              productId: line.productId,
+              batchId,
+              quantity: line.quantity,
+              remainingQuantity: line.quantity,
+              basePrice: line.effectiveBuyPrice,
+              tradePrice: line.sellPrice > 0 ? line.sellPrice : null,
+              condition: line.condition,
+              source: dto.source,
+              notes: dto.notes,
+            },
+          });
+          if (line.condition === StockCondition.FRESH) {
+            await tx.product.update({
+              where: { id: line.productId },
+              data: {
+                basePrice: line.effectiveBuyPrice,
+                ...(line.sellPrice > 0 ? { tradePrice: line.sellPrice } : {}),
+              },
+            });
+          }
+          await this.lots.recomputeProductStock(tx, line.productId);
+          await tx.transaction.create({
+            data: {
+              occurredAt: date,
+              amount: line.lineTotal,
+              type: TransactionType.purchase,
+              description: `Purchase ${purchaseId}: ${product.name} x${line.quantity} ${product.unit} from ${dto.source}`,
+              refTable: 'purchase_lines',
+              refId: purchaseId,
+            },
+          });
+        }
 
-      // Audit log
-      await tx.auditLog.create({
-        data: {
-          action: AuditAction.CREATE,
-          entity: 'Purchase',
-          entityId: id,
-          after: purchase as unknown as Prisma.InputJsonValue,
-        },
-      });
+        const purchase = await tx.purchase.create({
+          data: {
+            id: purchaseId,
+            date,
+            source: dto.source,
+            notes: dto.notes,
+            bankAccountId: dto.bankAccountId,
+            batchId,
+            total,
+            status: 'confirmed',
+            lines: {
+              create: computedLines.map((l) => ({
+                productId: l.productId,
+                quantity: l.quantity,
+                basePrice: l.basePrice,
+                transportCost: l.transportCost,
+                labourCost: l.labourCost,
+                otherCost: l.otherCost,
+                effectiveBuyPrice: l.effectiveBuyPrice,
+                sellPrice: l.sellPrice,
+                profitPercent: l.profitPercent,
+                condition: l.condition,
+              })),
+            },
+          },
+          include: {
+            lines: { include: { product: { select: { name: true, unit: true } } } },
+            bankAccount: true,
+            batch: true,
+          },
+        });
 
-      return purchase;
-    });
+        // Deduct bank in one shot for the full total. Re-fetch inside the tx so
+        // concurrent purchases see each other; the bank_accounts.balance CHECK
+        // constraint is the ultimate safety net against a lost-update race.
+        if (dto.bankAccountId) {
+          const bank = await tx.bankAccount.findFirst({
+            where: { id: dto.bankAccountId, deletedAt: null },
+            select: { balance: true },
+          });
+          if (!bank) {
+            throw new BadRequestException({
+              code: 'INVALID_BANK_ACCOUNT',
+              message: `Bank account ${dto.bankAccountId} not found`,
+            });
+          }
+          if (bank.balance < total) {
+            throw new BadRequestException({
+              code: 'INSUFFICIENT_BALANCE',
+              message: `Insufficient balance. Current: ৳${bank.balance}, Requested: ৳${total}`,
+              fields: { balance: bank.balance, requested: total },
+            });
+          }
+          await tx.bankAccount.update({
+            where: { id: dto.bankAccountId },
+            data: { balance: { decrement: total } },
+          });
+          await tx.bankTransaction.create({
+            data: {
+              bankAccountId: dto.bankAccountId,
+              type: 'withdrawal',
+              amount: total,
+              description: `Purchase ${purchaseId} (${computedLines.length} line${computedLines.length > 1 ? 's' : ''}) from ${dto.source}`,
+              reference: purchaseId,
+              occurredAt: date,
+            },
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            action: AuditAction.CREATE,
+            entity: 'Purchase',
+            entityId: purchaseId,
+            after: purchase as unknown as Prisma.InputJsonValue,
+          },
+        });
+
+        return purchase;
+      },
+      { timeout: 60000, maxWait: 8000 },
+    );
   }
 
   async findAll(q: ListPurchasesQueryDto): Promise<ListResponse<unknown>> {
     const where: Prisma.PurchaseWhereInput = {
       deletedAt: null,
-      ...(q.productId ? { productId: q.productId } : {}),
+      ...(q.productId ? { lines: { some: { productId: q.productId } } } : {}),
       ...(q.dateFrom || q.dateTo
         ? {
             date: {
@@ -186,13 +270,13 @@ export class PurchasesService {
             OR: [
               { id: { contains: q.q.toUpperCase() } },
               { source: { contains: q.q, mode: 'insensitive' } },
-              { product: { name: { contains: q.q, mode: 'insensitive' } } },
+              { lines: { some: { product: { name: { contains: q.q, mode: 'insensitive' } } } } },
             ],
           }
         : {}),
     };
 
-    const orderBy = q.parseSort(['date', 'createdAt', 'quantity']) ?? { date: 'desc' };
+    const orderBy = q.parseSort(['date', 'createdAt', 'total']) ?? { date: 'desc' };
     const [items, total] = await Promise.all([
       this.prisma.purchase.findMany({
         where,
@@ -200,8 +284,9 @@ export class PurchasesService {
         skip: q.skip,
         take: q.take,
         include: {
-          product: { select: { name: true, unit: true } },
+          lines: { include: { product: { select: { name: true, unit: true } } } },
           bankAccount: { select: { bankName: true, accountNumber: true } },
+          batch: { select: { id: true, date: true } },
         },
       }),
       this.prisma.purchase.count({ where }),
@@ -213,8 +298,13 @@ export class PurchasesService {
     const p = await this.prisma.purchase.findFirst({
       where: { id, deletedAt: null },
       include: {
-        product: { select: { name: true, unit: true, category: { select: { name: true } } } },
+        lines: {
+          include: {
+            product: { select: { name: true, unit: true, category: { select: { name: true } } } },
+          },
+        },
         bankAccount: true,
+        batch: true,
       },
     });
     if (!p) throw new NotFoundException({ code: 'NOT_FOUND', message: `Purchase ${id} not found` });
@@ -223,50 +313,17 @@ export class PurchasesService {
 
   async update(id: string, dto: UpdatePurchaseDto) {
     const existing = await this.findOne(id);
-
-    const quantity = dto.quantity ?? existing.quantity;
-    const basePrice = dto.basePrice ?? existing.basePrice;
-    const transportCost = dto.transportCost ?? existing.transportCost;
-    const labourCost = dto.labourCost ?? existing.labourCost;
-    const otherCost = dto.otherCost ?? existing.otherCost;
-
-    const effectiveBuyPrice = this.calcEffectiveBuyPrice(
-      basePrice, quantity, transportCost, labourCost, otherCost,
-    );
-
-    let sellPrice = dto.sellPrice ?? existing.sellPrice;
-    let profitPercent = dto.profitPercent;
-
-    if (profitPercent !== undefined && !dto.sellPrice) {
-      sellPrice = this.calcSellPrice(effectiveBuyPrice, profitPercent);
-    }
-
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.purchase.update({
         where: { id },
         data: {
           ...(dto.date ? { date: parseDhakaDateOnly(dto.date) } : {}),
-          quantity,
-          basePrice,
-          transportCost,
-          labourCost,
-          otherCost,
-          effectiveBuyPrice,
-          sellPrice,
-          profitPercent,
           ...(dto.source ? { source: dto.source } : {}),
           ...(dto.notes !== undefined ? { notes: dto.notes } : {}),
           ...(dto.bankAccountId !== undefined ? { bankAccountId: dto.bankAccountId } : {}),
         },
-        include: { product: { select: { name: true, unit: true } } },
-      });
-
-      // Update product prices from this purchase
-      await tx.product.update({
-        where: { id: existing.productId },
-        data: {
-          buyPrice: effectiveBuyPrice,
-          ...(sellPrice > 0 ? { sellPrice } : {}),
+        include: {
+          lines: { include: { product: { select: { name: true, unit: true } } } },
         },
       });
 
@@ -279,7 +336,6 @@ export class PurchasesService {
           after: updated as unknown as Prisma.InputJsonValue,
         },
       });
-
       return updated;
     });
   }

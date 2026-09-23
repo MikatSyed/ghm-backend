@@ -11,7 +11,10 @@ import { UpdateExpenseDto } from './dto/update-expense.dto';
 
 @Injectable()
 export class ExpensesService {
-  constructor(private readonly prisma: PrismaService, private readonly ids: PrefixIdService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ids: PrefixIdService,
+  ) {}
 
   async create(dto: CreateExpenseDto) {
     const id = await this.ids.next('EXP', 3);

@@ -15,6 +15,7 @@ import { DistributionsService } from './distributions.service';
 import { AddDistributionLineDto } from './dto/add-line.dto';
 import { CreateDistributionDto } from './dto/create-distribution.dto';
 import { ListDistributionsQueryDto } from './dto/list-distributions.query';
+import { SalvageLineDto } from './dto/salvage-line.dto';
 import { UpdateDistributionLineDto } from './dto/update-line.dto';
 
 @ApiTags('distributions')
@@ -62,6 +63,18 @@ export class DistributionsController {
     @Body() dto: UpdateDistributionLineDto,
   ) {
     return this.service.updateLine(id, lineId, dto);
+  }
+
+  @Post(':id/lines/:lineId/salvage')
+  @ApiOperation({
+    summary: 'Move damaged qty off the van into a reduced-price DAMAGED warehouse lot',
+  })
+  salvageLine(
+    @Param('id') id: string,
+    @Param('lineId') lineId: string,
+    @Body() dto: SalvageLineDto,
+  ) {
+    return this.service.salvageLine(id, lineId, dto);
   }
 
   @Delete(':id/lines/:lineId')

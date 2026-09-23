@@ -4,6 +4,7 @@ import 'winston-daily-rotate-file';
 
 export function buildWinstonConfig(env: string, level: string): winston.LoggerOptions {
   const isProd = env === 'production';
+  const isServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
 
   const consoleFormat = isProd
     ? winston.format.combine(winston.format.timestamp(), winston.format.json())
@@ -20,7 +21,7 @@ export function buildWinstonConfig(env: string, level: string): winston.LoggerOp
     new winston.transports.Console({ format: consoleFormat }),
   ];
 
-  if (isProd) {
+  if (isProd && !isServerless) {
     transports.push(
       new winston.transports.DailyRotateFile({
         dirname: 'logs',

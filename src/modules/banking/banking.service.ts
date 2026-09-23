@@ -31,7 +31,8 @@ export class BankingService {
         },
       },
     });
-    if (!acc) throw new NotFoundException({ code: 'NOT_FOUND', message: `Bank account ${id} not found` });
+    if (!acc)
+      throw new NotFoundException({ code: 'NOT_FOUND', message: `Bank account ${id} not found` });
     return acc;
   }
 
@@ -64,7 +65,10 @@ export class BankingService {
       where: { id: accountId, deletedAt: null },
     });
     if (!account) {
-      throw new NotFoundException({ code: 'NOT_FOUND', message: `Bank account ${accountId} not found` });
+      throw new NotFoundException({
+        code: 'NOT_FOUND',
+        message: `Bank account ${accountId} not found`,
+      });
     }
 
     if (dto.type === 'withdrawal' && account.balance < dto.amount) {
@@ -91,10 +95,7 @@ export class BankingService {
       await tx.bankAccount.update({
         where: { id: accountId },
         data: {
-          balance:
-            dto.type === 'deposit'
-              ? { increment: dto.amount }
-              : { decrement: dto.amount },
+          balance: dto.type === 'deposit' ? { increment: dto.amount } : { decrement: dto.amount },
         },
       });
 
@@ -154,10 +155,7 @@ export class BankingService {
       await prisma.bankAccount.update({
         where: { id: accountId },
         data: {
-          balance:
-            tx.type === 'deposit'
-              ? { decrement: tx.amount }
-              : { increment: tx.amount },
+          balance: tx.type === 'deposit' ? { decrement: tx.amount } : { increment: tx.amount },
         },
       });
     });
@@ -168,7 +166,14 @@ export class BankingService {
   async getSummary() {
     const accounts = await this.prisma.bankAccount.findMany({
       where: { deletedAt: null },
-      select: { id: true, bankName: true, accountNumber: true, accountHolder: true, balance: true, isActive: true },
+      select: {
+        id: true,
+        bankName: true,
+        accountNumber: true,
+        accountHolder: true,
+        balance: true,
+        isActive: true,
+      },
     });
 
     const totalBalance = accounts.reduce((sum, a) => sum + a.balance, 0);

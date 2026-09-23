@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, StockLotConsumerType, TransactionType } from '@prisma/client';
 import { listResponse, ListResponse } from '../../common/dto/pagination.dto';
-import { parseDhakaDateOnly } from '../../common/util/dhaka-time';
+import { dhakaTodayDateOnly, parseDhakaDateOnly } from '../../common/util/dhaka-time';
 import { PrefixIdService } from '../../common/services/prefix-id.service';
 import { StockLotService } from '../../common/services/stock-lot.service';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -26,75 +26,103 @@ export class StockEntriesService {
     const expiryDate = dto.expiryDate ? parseDhakaDateOnly(dto.expiryDate) : null;
     return this.prisma.$transaction(
       async (tx) => {
-      const product = await tx.product.findFirst({ where: { id: dto.productId, deletedAt: null } });
-      if (!product) {
-        throw new BadRequestException({
-          code: 'INVALID_PRODUCT',
-          message: `Product ${dto.productId} not found`,
-          fields: { productId: 'unknown' },
+        const product = await tx.product.findFirst({
+          where: { id: dto.productId, deletedAt: null },
         });
-      }
-      const id = await this.ids.next('STK', 3, tx);
-      const entry = await tx.stockEntry.create({
-        data: {
-          id,
-          date,
-          productId: dto.productId,
-          quantity: dto.quantity,
-          remainingQuantity: dto.quantity,
-          expiryDate,
-          buyingRate: dto.buyingRate,
-          source: dto.source,
-          notes: dto.notes,
-        },
-      });
-      await this.lots.recomputeProductStock(tx, dto.productId);
-      await tx.transaction.create({
-        data: {
-          occurredAt: new Date(),
-          amount: dto.quantity * dto.buyingRate,
-          type: TransactionType.stock,
-          description: `Stock in: ${product.name} +${dto.quantity} ${product.unit} from ${dto.source}`,
-          refTable: 'stock_entries',
-          refId: entry.id,
-        },
-      });
-      return entry;
-    },
+        if (!product) {
+          throw new BadRequestException({
+            code: 'INVALID_PRODUCT',
+            message: `Product ${dto.productId} not found`,
+            fields: { productId: 'unknown' },
+          });
+        }
+        if (dto.batchId) {
+          const batch = await tx.stockBatch.findFirst({
+            where: { id: dto.batchId, deletedAt: null },
+            select: { id: true },
+          });
+          if (!batch) {
+            throw new BadRequestException({
+              code: 'INVALID_BATCH',
+              message: `Stock batch ${dto.batchId} not found`,
+              fields: { batchId: 'unknown' },
+            });
+          }
+        }
+        const id = await this.ids.next('STK', 3, tx);
+        const entry = await tx.stockEntry.create({
+          data: {
+            id,
+            date,
+            productId: dto.productId,
+            batchId: dto.batchId,
+            quantity: dto.quantity,
+            remainingQuantity: dto.quantity,
+            expiryDate,
+            basePrice: dto.basePrice,
+            source: dto.source,
+            notes: dto.notes,
+          },
+        });
+        await this.lots.recomputeProductStock(tx, dto.productId);
+        await tx.transaction.create({
+          data: {
+            occurredAt: new Date(),
+            amount: dto.quantity * dto.basePrice,
+            type: TransactionType.stock,
+            description: `Stock in: ${product.name} +${dto.quantity} ${product.unit} from ${dto.source}`,
+            refTable: 'stock_entries',
+            refId: entry.id,
+          },
+        });
+        return entry;
+      },
       { timeout: 20000, maxWait: 5000 },
     );
   }
 
   async findAll(q: ListStockEntriesQueryDto): Promise<ListResponse<unknown>> {
-    const where: Prisma.StockEntryWhereInput = {
-      deletedAt: null,
-      ...(q.productId ? { productId: q.productId } : {}),
-      ...(q.dateFrom || q.dateTo
-        ? {
-            date: {
-              ...(q.dateFrom ? { gte: parseDhakaDateOnly(q.dateFrom) } : {}),
-              ...(q.dateTo ? { lte: parseDhakaDateOnly(q.dateTo) } : {}),
-            },
-          }
-        : {}),
-      ...(q.q
-        ? {
-            OR: [
-              { id: { contains: q.q.toUpperCase() } },
-              { source: { contains: q.q, mode: 'insensitive' } },
-              { product: { name: { contains: q.q, mode: 'insensitive' } } },
-            ],
-          }
-        : {}),
-    };
-    const orderBy = q.parseSort(['date', 'createdAt', 'quantity']) ?? { date: 'desc' };
+    const today = dhakaTodayDateOnly();
+    const ands: Prisma.StockEntryWhereInput[] = [{ deletedAt: null }];
+    if (q.productId) ands.push({ productId: q.productId });
+    if (q.condition) ands.push({ condition: q.condition });
+    if (q.available) {
+      ands.push({ remainingQuantity: { gt: 0 } });
+      ands.push({ OR: [{ expiryDate: null }, { expiryDate: { gte: today } }] });
+    }
+    if (q.dateFrom || q.dateTo) {
+      ands.push({
+        date: {
+          ...(q.dateFrom ? { gte: parseDhakaDateOnly(q.dateFrom) } : {}),
+          ...(q.dateTo ? { lte: parseDhakaDateOnly(q.dateTo) } : {}),
+        },
+      });
+    }
+    if (q.q) {
+      ands.push({
+        OR: [
+          { id: { contains: q.q.toUpperCase() } },
+          { source: { contains: q.q, mode: 'insensitive' } },
+          { product: { name: { contains: q.q, mode: 'insensitive' } } },
+        ],
+      });
+    }
+    const where: Prisma.StockEntryWhereInput = { AND: ands };
+    const orderBy =
+      q.parseSort(['date', 'createdAt', 'quantity']) ??
+      (q.available
+        ? [{ date: 'asc' as const }, { createdAt: 'asc' as const }]
+        : { date: 'desc' as const });
     const [items, total] = await Promise.all([
       this.prisma.stockEntry.findMany({
         where,
         orderBy,
         skip: q.skip,
         take: q.take,
-        include: { product: { select: { name: true, unit: true } } },
+        include: {
+          product: { select: { name: true, unit: true, tradePrice: true } },
+          ...(q.available ? { batch: { select: { id: true, date: true, source: true } } } : {}),
+        },
       }),
       this.prisma.stockEntry.count({ where }),
     ]);
@@ -111,7 +139,8 @@ export class StockEntriesService {
         },
       },
     });
-    if (!e) throw new NotFoundException({ code: 'NOT_FOUND', message: `Stock entry ${id} not found` });
+    if (!e)
+      throw new NotFoundException({ code: 'NOT_FOUND', message: `Stock entry ${id} not found` });
     return e;
   }
 
@@ -147,8 +176,7 @@ export class StockEntriesService {
         if (distCount > 0 || saleCount > 0) {
           throw new ConflictException({
             code: 'IN_USE',
-            message:
-              'Stock entry has been consumed by downstream records and cannot be deleted',
+            message: 'Stock entry has been consumed by downstream records and cannot be deleted',
             fields: {
               distributionLines: distCount,
               saleItems: saleCount,
@@ -176,11 +204,7 @@ export class StockEntriesService {
           });
           if (!adj || adj.deletedAt) continue;
           affectedProductIds.add(adj.productId);
-          await this.lots.reverseAllocationsFor(
-            tx,
-            StockLotConsumerType.STOCK_ADJUSTMENT,
-            adjId,
-          );
+          await this.lots.reverseAllocationsFor(tx, StockLotConsumerType.STOCK_ADJUSTMENT, adjId);
           await tx.stockAdjustment.update({
             where: { id: adjId },
             data: { deletedAt: new Date() },

@@ -22,6 +22,10 @@ export interface VanSlice {
 export interface AllocateOpts {
   /** Allow consuming expired lots (default false). Use for WASTAGE/DAMAGE write-offs. */
   includeExpired?: boolean;
+  /** Restrict FIFO source pool to lots belonging to this batch. */
+  batchId?: string;
+  /** Restrict consumption to one exact warehouse stock lot. */
+  stockEntryId?: string;
 }
 
 function nonExpiredFilter(today: Date): Prisma.StockEntryWhereInput {
@@ -50,11 +54,13 @@ export class StockLotService {
       where: {
         productId,
         deletedAt: null,
+        ...(opts.stockEntryId ? { id: opts.stockEntryId } : {}),
         remainingQuantity: { gt: 0 },
+        ...(opts.batchId ? { batchId: opts.batchId } : {}),
         ...(opts.includeExpired ? {} : nonExpiredFilter(today)),
       },
-      orderBy: [{ date: 'asc' }, { id: 'asc' }],
-      select: { id: true, remainingQuantity: true, buyingRate: true },
+      orderBy: [{ date: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, remainingQuantity: true, basePrice: true },
     });
 
     const slices: WarehouseSlice[] = [];
@@ -62,7 +68,7 @@ export class StockLotService {
     for (const lot of lots) {
       if (needed <= 0) break;
       const take = Math.min(lot.remainingQuantity, needed);
-      slices.push({ stockEntryId: lot.id, quantity: take, unitCost: lot.buyingRate });
+      slices.push({ stockEntryId: lot.id, quantity: take, unitCost: lot.basePrice });
       needed -= take;
     }
     if (needed > 0) throw new InsufficientStockException([productId]);

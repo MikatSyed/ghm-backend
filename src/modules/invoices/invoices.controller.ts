@@ -41,7 +41,10 @@ export class InvoicesController {
 
   @Get(':id/pdf')
   @ApiOperation({ summary: 'Download invoice as PDF' })
-  async getPdf(@Param('id') id: string, @Res({ passthrough: true }) res: Response): Promise<StreamableFile> {
+  async getPdf(
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
     const inv = await this.service.findOne(id);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${inv.id}.pdf"`);

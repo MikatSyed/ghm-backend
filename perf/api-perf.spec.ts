@@ -268,7 +268,7 @@ test.describe.serial('GHM-Server perf', () => {
           date: today,
           productId: fixtures.productId,
           quantity: 5,
-          buyingRate: 38,
+          basePrice: 38,
           source: 'PERF-TEST market',
         },
       ],

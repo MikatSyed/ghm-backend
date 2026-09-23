@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
 }
 
 datasource db {
@@ -71,21 +72,35 @@ model Product {
   name       String
   categoryId String
   unit       ProductUnit
-  buyPrice   Int          @default(0) // auto-updated from latest Purchase effectiveBuyPrice
-  sellPrice  Int          @default(0) // set by user via Purchase sell price
+  basePrice  Int          @default(0) // landed unit cost; auto-updated from latest FRESH stock entry
+  listPrice  Int          @default(0) // BP + tax% + profit% + others% — informational
+  tradePrice Int          @default(0) // LP + tax% + profit% + others% — the price actually charged
+  mrp        Int          @default(0) // TP + tax% + profit% + others% — informational/compliance only
   stock      Int          @default(0)
   status     EntityStatus @default(Active)
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
   deletedAt  DateTime?
 
-  category          Category           @relation(fields: [categoryId], references: [id])
-  stockEntries      StockEntry[]
-  distributionLines DistributionLine[]
-  saleItems         SaleItem[]
-  invoiceItems      InvoiceItem[]
-  stockAdjustments  StockAdjustment[]
-  purchases         Purchase[]
+  // "Default recipe" — last-used percentages, nullable, prefill only, not authoritative.
+  listTaxPercent     Int?
+  listProfitPercent  Int?
+  listOthersPercent  Int?
+  tradeTaxPercent    Int?
+  tradeProfitPercent Int?
+  tradeOthersPercent Int?
+  mrpTaxPercent      Int?
+  mrpProfitPercent   Int?
+  mrpOthersPercent   Int?
+
+  category               Category                @relation(fields: [categoryId], references: [id])
+  stockEntries           StockEntry[]
+  distributionLines      DistributionLine[]
+  saleItems              SaleItem[]
+  invoiceItems           InvoiceItem[]
+  stockAdjustments       StockAdjustment[]
+  purchaseLines          PurchaseLine[]
+  distributionOrderLines DistributionOrderLine[]
 
   @@index([name])
   @@index([categoryId])
@@ -115,30 +130,114 @@ model Van {
 }
 
 // ----------------------------------------------------------------------
+// Customers — restaurants/shops/direct buyers billed outside the van round.
+// ----------------------------------------------------------------------
+
+enum CustomerType {
+  RESTAURANT
+  SHOP
+  DIRECT
+  OTHER
+}
+
+model Customer {
+  id        String       @id // "CUS-001"
+  name      String
+  type      CustomerType
+  phone     String?
+  address   String?
+  status    EntityStatus @default(Active)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  deletedAt DateTime?
+
+  distributionOrders DistributionOrder[]
+  sales              Sale[]
+  invoices           Invoice[]
+
+  @@index([name])
+  @@index([type])
+  @@map("customers")
+}
+
+// ----------------------------------------------------------------------
 // Stock Entries
 // ----------------------------------------------------------------------
 
+// Condition of a lot at the time it entered the warehouse.
+// FRESH = default, full price. AGING = older stock to push first. DAMAGED =
+// reduced-price salvage. CUSTOM = anything else (notes carry the meaning).
+// FIFO groups by condition so damaged and fresh of the same product never mix.
+enum StockCondition {
+  FRESH
+  AGING
+  DAMAGED
+  CUSTOM
+}
+
 model StockEntry {
-  id                String    @id // "STK-992"
-  date              DateTime  @db.Date
+  id                String         @id // "STK-992"
+  date              DateTime       @db.Date
   productId         String
+  batchId           String? // optional: physical batch this entry belongs to
   quantity          Int
-  remainingQuantity Int       // FIFO lot balance; decremented by distribution allocate + warehouse adjustment
-  expiryDate        DateTime? @db.Date
-  buyingRate        Int
+  remainingQuantity Int // FIFO lot balance; decremented by distribution allocate + warehouse adjustment
+  expiryDate        DateTime?      @db.Date
+  basePrice         Int // this lot's real landed cost; always known at intake, never a fallback
+  listPrice         Int? // per-lot override; when null, downstream falls back to Product.listPrice
+  tradePrice        Int? // per-lot override; when null, downstream falls back to Product.tradePrice
+  mrp               Int? // per-lot override; when null, downstream falls back to Product.mrp
+  condition         StockCondition @default(FRESH)
   source            String
   notes             String?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
   deletedAt         DateTime?
 
+  // Captured buildup inputs for this lot (nullable — not always known, e.g. salvaged/damaged lots).
+  listTaxPercent     Int?
+  listProfitPercent  Int?
+  listOthersPercent  Int?
+  tradeTaxPercent    Int?
+  tradeProfitPercent Int?
+  tradeOthersPercent Int?
+  mrpTaxPercent      Int?
+  mrpProfitPercent   Int?
+  mrpOthersPercent   Int?
+
   product     Product              @relation(fields: [productId], references: [id])
+  batch       StockBatch?          @relation(fields: [batchId], references: [id])
   allocations StockLotAllocation[]
 
   @@index([productId])
   @@index([date])
+  @@index([batchId])
   @@index([productId, remainingQuantity])
+  @@index([productId, condition, remainingQuantity])
   @@map("stock_entries")
+}
+
+// ----------------------------------------------------------------------
+// Stock Batches — a physical receiving group that holds one or more
+// StockEntry lines (possibly across different products). Created
+// directly via the batches endpoint, or auto-created by a Purchase.
+// ----------------------------------------------------------------------
+
+model StockBatch {
+  id        String    @id // "BAT-001"
+  date      DateTime  @db.Date
+  source    String // supplier or origin shared across all lines
+  notes     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  entries           StockEntry[]
+  purchases         Purchase[]
+  distributionLines DistributionLine[]
+
+  @@index([date])
+  @@map("stock_batches")
 }
 
 // ----------------------------------------------------------------------
@@ -198,7 +297,7 @@ model StockAdjustment {
   id        String                @id // "ADJ-001"
   date      DateTime              @db.Date
   productId String
-  quantity  Int                   // positive; positive = decrease, negative = increase (CORRECTION only)
+  quantity  Int // positive; positive = decrease, negative = increase (CORRECTION only)
   reason    StockAdjustmentReason
   location  StockLocation
   vanId     String?
@@ -231,24 +330,82 @@ model Distribution {
   van   Van                @relation(fields: [vanId], references: [id])
   lines DistributionLine[]
 
-  @@unique([vanId, date])
+  @@index([vanId, date])
   @@index([date])
   @@map("distributions")
 }
 
 model DistributionLine {
-  id             String   @id @default(uuid())
+  id             String  @id @default(uuid())
   distributionId String
   productId      String
+  batchId        String? // optional: constrain FIFO allocation to a specific batch
   allocated      Int
-  returned       Int      @default(0) // normal return → goes back to warehouse stock
-  damageReturned Int      @default(0) // damaged return → counted as loss/wastage
+  returned       Int     @default(0) // normal return → goes back to warehouse stock
+  damageReturned Int     @default(0) // damaged return → counted as loss/wastage
 
   distribution Distribution @relation(fields: [distributionId], references: [id], onDelete: Cascade)
   product      Product      @relation(fields: [productId], references: [id])
+  batch        StockBatch?  @relation(fields: [batchId], references: [id])
 
-  @@unique([distributionId, productId])
+  @@index([distributionId, productId])
+  @@index([batchId])
   @@map("distribution_lines")
+}
+
+// ----------------------------------------------------------------------
+// Distribution Orders — restaurant/shop issue → confirm flow. Unlike
+// Distribution (above), creating an order does NOT move stock: no
+// StockLotAllocation, no Product.stock change. Only /confirm allocates FIFO
+// warehouse lots (straight to a SALE_ITEM, no DistributionLine hop) for the
+// confirmed quantities and produces a Sale + Invoice. Deliberately a separate
+// model from Distribution/DistributionLine — those already have an
+// allocate-on-create lifecycle wired into the van workflow (updateLine
+// returns/damage, salvageLine, Sale.finalize's allocateFromVan chain) and
+// reusing them for this issue-first flow would give one model two
+// incompatible lifecycles.
+// ----------------------------------------------------------------------
+
+enum DistributionOrderStatus {
+  issued
+  confirmed
+  cancelled
+}
+
+model DistributionOrder {
+  id          String                  @id // "DOR-001"
+  customerId  String
+  date        DateTime                @db.Date
+  status      DistributionOrderStatus @default(issued)
+  confirmedAt DateTime?
+  saleId      String?                 @unique
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+  deletedAt   DateTime?
+
+  customer Customer                @relation(fields: [customerId], references: [id])
+  sale     Sale?                   @relation(fields: [saleId], references: [id])
+  lines    DistributionOrderLine[]
+
+  @@index([customerId, date])
+  @@index([date])
+  @@index([status])
+  @@map("distribution_orders")
+}
+
+model DistributionOrderLine {
+  id                  String @id @default(uuid())
+  distributionOrderId String
+  productId           String
+  requestedQty        Int
+  confirmedQty        Int? // null until confirm; 0..requestedQty
+  price               Int? // null until confirm
+
+  distributionOrder DistributionOrder @relation(fields: [distributionOrderId], references: [id], onDelete: Cascade)
+  product           Product           @relation(fields: [productId], references: [id])
+
+  @@index([distributionOrderId, productId])
+  @@map("distribution_order_lines")
 }
 
 // ----------------------------------------------------------------------
@@ -260,21 +417,32 @@ enum InvoiceStatus {
   paid
 }
 
-model Sale {
-  id        String    @id // "SAL-001"
-  vanId     String
-  date      DateTime  @db.Date
-  total     Int
-  invoiceId String?   @unique
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  deletedAt DateTime?
+enum SaleType {
+  VAN
+  DISTRIBUTION_CONFIRMATION
+  DIRECT_CUSTOMER
+}
 
-  van     Van        @relation(fields: [vanId], references: [id])
-  items   SaleItem[]
-  invoice Invoice?   @relation(fields: [invoiceId], references: [id])
+model Sale {
+  id         String    @id // "SAL-001"
+  vanId      String?
+  customerId String?
+  type       SaleType  @default(VAN)
+  date       DateTime  @db.Date
+  total      Int
+  invoiceId  String?   @unique
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  van               Van?               @relation(fields: [vanId], references: [id])
+  customer          Customer?          @relation(fields: [customerId], references: [id])
+  items             SaleItem[]
+  invoice           Invoice?           @relation(fields: [invoiceId], references: [id])
+  distributionOrder DistributionOrder?
 
   @@index([vanId, date])
+  @@index([customerId, date])
   @@map("sales")
 }
 
@@ -292,19 +460,21 @@ model SaleItem {
 }
 
 model Invoice {
-  id        String        @id // "INV-1024"
-  vanId     String
-  date      DateTime      @db.Date
-  total     Int
-  status    InvoiceStatus @default(unpaid)
-  paidAt    DateTime?
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
-  deletedAt DateTime?
+  id         String        @id // "INV-1024"
+  vanId      String?
+  customerId String?
+  date       DateTime      @db.Date
+  total      Int
+  status     InvoiceStatus @default(unpaid)
+  paidAt     DateTime?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  deletedAt  DateTime?
 
-  van   Van           @relation(fields: [vanId], references: [id])
-  items InvoiceItem[]
-  sale  Sale?
+  van      Van?          @relation(fields: [vanId], references: [id])
+  customer Customer?     @relation(fields: [customerId], references: [id])
+  items    InvoiceItem[]
+  sale     Sale?
 
   @@index([status])
   @@index([date])
@@ -336,15 +506,15 @@ enum ExpenseStatus {
 }
 
 model Expense {
-  id          String          @id // "EXP-001"
-  date        DateTime        @db.Date
-  category    String          // "Fuel" | "Van Rent" | "Labor Cost" | "Shipping Cost" | "Market Fees"
+  id          String        @id // "EXP-001"
+  date        DateTime      @db.Date
+  category    String // "Fuel" | "Van Rent" | "Labor Cost" | "Shipping Cost" | "Market Fees"
   amount      Int
   description String
-  status      ExpenseStatus   @default(pending)
+  status      ExpenseStatus @default(pending)
   vanId       String?
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
   deletedAt   DateTime?
 
   van Van? @relation(fields: [vanId], references: [id])
@@ -383,7 +553,7 @@ model Transaction {
 }
 
 // ----------------------------------------------------------------------
-// Purchase & Shipment (cost calculation for buy/sell price)
+// Purchase (cost calculation for buy/sell price)
 // ----------------------------------------------------------------------
 
 enum PurchaseStatus {
@@ -391,57 +561,49 @@ enum PurchaseStatus {
   confirmed
 }
 
-model Shipment {
-  id            String         @id // "SHP-001"
+model Purchase {
+  id            String         @id // "PUR-001"
   date          DateTime       @db.Date
-  transportCost Int            @default(0) // total truck transport cost
-  labourCost    Int            @default(0) // total truck labour cost
-  otherCost     Int            @default(0) // other overheads for the whole truck
-  totalAmount   Int            @default(0) // calculated: sum(purchases) + overheads
-  source        String         // supplier / market
+  source        String // supplier / source name (shared across lines)
   notes         String?
   status        PurchaseStatus @default(confirmed)
-  bankAccountId String?
+  bankAccountId String? // optional: deducted from bank account
+  batchId       String? // auto-created StockBatch this purchase fed into
+  total         Int            @default(0) // sum of all line totals (basePrice*qty + costs)
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   deletedAt     DateTime?
 
-  purchases   Purchase[]
-  bankAccount BankAccount? @relation(fields: [bankAccountId], references: [id])
+  lines       PurchaseLine[]
+  bankAccount BankAccount?   @relation(fields: [bankAccountId], references: [id])
+  batch       StockBatch?    @relation(fields: [batchId], references: [id])
 
   @@index([date])
-  @@map("shipments")
+  @@index([batchId])
+  @@map("purchases")
 }
 
-model Purchase {
-  id                String         @id // "PUR-001"
-  shipmentId        String?        // optional: link to a shipment/truck
-  date              DateTime       @db.Date
+model PurchaseLine {
+  id                String         @id @default(uuid())
+  purchaseId        String
   productId         String
-  quantity          Int            // total quantity purchased
-  basePrice         Int            // base price per unit (BDT)
-  transportCost     Int            @default(0) // allocated share from shipment or manual
-  labourCost        Int            @default(0) // allocated share from shipment or manual
-  otherCost         Int            @default(0) // allocated share from shipment or manual
-  effectiveBuyPrice Int            // calculated: (basePrice * qty + all costs) / qty → per unit
-  sellPrice         Int            @default(0) // sell price set by user
-  profitPercent     Int?           // optional profit % used to suggest sell price
-  source            String         // supplier / source name
-  notes             String?
-  status            PurchaseStatus @default(confirmed)
-  bankAccountId     String?        // optional: deducted from bank account (if not part of shipment)
+  quantity          Int
+  basePrice         Int // base price per unit (BDT)
+  transportCost     Int            @default(0)
+  labourCost        Int            @default(0)
+  otherCost         Int            @default(0)
+  effectiveBuyPrice Int // (basePrice*qty + transport + labour + other) / qty
+  sellPrice         Int            @default(0)
+  profitPercent     Int?
+  condition         StockCondition @default(FRESH)
   createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
-  deletedAt         DateTime?
 
-  product     Product      @relation(fields: [productId], references: [id])
-  bankAccount BankAccount? @relation(fields: [bankAccountId], references: [id])
-  shipment    Shipment?    @relation(fields: [shipmentId], references: [id])
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id])
 
+  @@index([purchaseId])
   @@index([productId])
-  @@index([date])
-  @@index([shipmentId])
-  @@map("purchases")
+  @@map("purchase_lines")
 }
 
 // ----------------------------------------------------------------------
@@ -454,33 +616,32 @@ enum BankTransactionType {
 }
 
 model BankAccount {
-  id            String       @id @default(uuid())
+  id            String    @id @default(uuid())
   bankName      String
   accountNumber String
   accountHolder String?
-  balance       Int          @default(0) // current balance in BDT
-  isActive      Boolean      @default(true)
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  balance       Int       @default(0) // current balance in BDT
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
   deletedAt     DateTime?
 
   transactions BankTransaction[]
   purchases    Purchase[]
-  shipments    Shipment[]
 
   @@map("bank_accounts")
 }
 
 model BankTransaction {
-  id            String               @id @default(uuid())
+  id            String              @id @default(uuid())
   bankAccountId String
   type          BankTransactionType
-  amount        Int                  // positive integer (BDT)
+  amount        Int // positive integer (BDT)
   description   String?
-  reference     String?              // cheque no, transfer ref, etc.
+  reference     String? // cheque no, transfer ref, etc.
   occurredAt    DateTime
-  createdAt     DateTime             @default(now())
-  updatedAt     DateTime             @updatedAt
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
 
   bankAccount BankAccount @relation(fields: [bankAccountId], references: [id])
 

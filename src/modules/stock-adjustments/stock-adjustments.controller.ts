@@ -32,11 +32,18 @@ export class StockAdjustmentsController {
     summary: 'Paginated audit log for all stock adjustments (CREATE / DELETE entries).',
   })
   audit(@Query() q: PaginationQueryDto) {
-    return this.service.auditAll({ page: q.page, pageSize: q.pageSize, skip: q.skip, take: q.take });
+    return this.service.auditAll({
+      page: q.page,
+      pageSize: q.pageSize,
+      skip: q.skip,
+      take: q.take,
+    });
   }
 
   @Post()
-  @ApiOperation({ summary: 'Record damage / wastage / correction; decrements warehouse stock if WAREHOUSE' })
+  @ApiOperation({
+    summary: 'Record damage / wastage / correction; decrements warehouse stock if WAREHOUSE',
+  })
   create(@Body() dto: CreateStockAdjustmentDto) {
     return this.service.create(dto);
   }
@@ -48,7 +55,8 @@ export class StockAdjustmentsController {
 
   @Get(':id/history')
   @ApiOperation({
-    summary: 'Audit trail for a stock adjustment: AuditLog entries, financial transactions, and lot allocations.',
+    summary:
+      'Audit trail for a stock adjustment: AuditLog entries, financial transactions, and lot allocations.',
   })
   history(@Param('id') id: string) {
     return this.service.history(id);

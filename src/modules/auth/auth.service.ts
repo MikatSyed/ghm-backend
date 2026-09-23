@@ -21,11 +21,17 @@ export class AuthService {
       where: { email: email.toLowerCase(), deletedAt: null },
     });
     if (!user || !user.isActive) {
-      throw new UnauthorizedException({ code: 'INVALID_CREDENTIALS', message: 'Invalid credentials.' });
+      throw new UnauthorizedException({
+        code: 'INVALID_CREDENTIALS',
+        message: 'Invalid credentials.',
+      });
     }
     const ok = await argon2.verify(user.passwordHash, password);
     if (!ok) {
-      throw new UnauthorizedException({ code: 'INVALID_CREDENTIALS', message: 'Invalid credentials.' });
+      throw new UnauthorizedException({
+        code: 'INVALID_CREDENTIALS',
+        message: 'Invalid credentials.',
+      });
     }
     const token = await this.jwt.signAsync({
       sub: user.id,

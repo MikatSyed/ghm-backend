@@ -24,17 +24,19 @@ import { AuthModule } from './modules/auth/auth.module';
 import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard';
 import { RolesGuard } from './modules/auth/guards/roles.guard';
 import { BankingModule } from './modules/banking/banking.module';
+import { CustomersModule } from './modules/customers/customers.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
+import { DistributionOrdersModule } from './modules/distribution-orders/distribution-orders.module';
 import { DistributionsModule } from './modules/distributions/distributions.module';
 import { ExpensesModule } from './modules/expenses/expenses.module';
 import { InvoicesModule } from './modules/invoices/invoices.module';
 import { ProductsModule } from './modules/products/products.module';
 import { PurchasesModule } from './modules/purchases/purchases.module';
-import { ShipmentsModule } from './modules/shipments/shipments.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { SalesModule } from './modules/sales/sales.module';
 import { SearchModule } from './modules/search/search.module';
 import { StockAdjustmentsModule } from './modules/stock-adjustments/stock-adjustments.module';
+import { StockBatchesModule } from './modules/stock-batches/stock-batches.module';
 import { StockEntriesModule } from './modules/stock-entries/stock-entries.module';
 import { VansModule } from './modules/vans/vans.module';
 
@@ -71,12 +73,14 @@ import { VansModule } from './modules/vans/vans.module';
     CategoriesModule,
     ProductsModule,
     PurchasesModule,
-    ShipmentsModule,
     BankingModule,
     StockEntriesModule,
+    StockBatchesModule,
     StockAdjustmentsModule,
     VansModule,
+    CustomersModule,
     DistributionsModule,
+    DistributionOrdersModule,
     SalesModule,
     InvoicesModule,
     ExpensesModule,

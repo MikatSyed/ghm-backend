@@ -21,7 +21,10 @@ export class ReportsService {
       case 'profit-by-van':
         return this.profitByVan(range);
       default:
-        throw new BadRequestException({ code: 'UNKNOWN_REPORT', message: `Unknown report ${type}` });
+        throw new BadRequestException({
+          code: 'UNKNOWN_REPORT',
+          message: `Unknown report ${type}`,
+        });
     }
   }
 
@@ -40,15 +43,22 @@ export class ReportsService {
     const rows = await this.prisma.invoice.findMany({
       where: {
         deletedAt: null,
-        ...(range.gte || range.lte ? { date: { ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) } } : {}),
+        ...(range.gte || range.lte
+          ? {
+              date: {
+                ...(range.gte ? { gte: range.gte } : {}),
+                ...(range.lte ? { lte: range.lte } : {}),
+              },
+            }
+          : {}),
       },
-      include: { van: true, _count: { select: { items: true } } },
+      include: { van: true, customer: true, _count: { select: { items: true } } },
       orderBy: { date: 'desc' },
     });
     return rows.map((r) => ({
       id: r.id,
       date: r.date.toISOString().slice(0, 10),
-      van: r.van.vanName,
+      van: r.van?.vanName ?? r.customer?.name ?? 'N/A',
       items: r._count.items,
       total: r.total,
       status: r.status,
@@ -59,7 +69,14 @@ export class ReportsService {
     const rows = await this.prisma.expense.findMany({
       where: {
         deletedAt: null,
-        ...(range.gte || range.lte ? { date: { ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) } } : {}),
+        ...(range.gte || range.lte
+          ? {
+              date: {
+                ...(range.gte ? { gte: range.gte } : {}),
+                ...(range.lte ? { lte: range.lte } : {}),
+              },
+            }
+          : {}),
       },
       orderBy: { date: 'desc' },
     });
@@ -78,7 +95,14 @@ export class ReportsService {
     const rows = await this.prisma.stockEntry.findMany({
       where: {
         deletedAt: null,
-        ...(range.gte || range.lte ? { date: { ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) } } : {}),
+        ...(range.gte || range.lte
+          ? {
+              date: {
+                ...(range.gte ? { gte: range.gte } : {}),
+                ...(range.lte ? { lte: range.lte } : {}),
+              },
+            }
+          : {}),
       },
       include: { product: { select: { name: true, unit: true } } },
       orderBy: { date: 'desc' },
@@ -89,8 +113,8 @@ export class ReportsService {
       product: r.product.name,
       unit: r.product.unit,
       quantity: r.quantity,
-      buyingRate: r.buyingRate,
-      total: r.quantity * r.buyingRate,
+      basePrice: r.basePrice,
+      total: r.quantity * r.basePrice,
       source: r.source,
     }));
   }
@@ -98,9 +122,14 @@ export class ReportsService {
   private async profitByVan(range: { gte?: Date; lte?: Date }) {
     const dateFilter =
       range.gte || range.lte
-        ? { date: { ...(range.gte ? { gte: range.gte } : {}), ...(range.lte ? { lte: range.lte } : {}) } }
+        ? {
+            date: {
+              ...(range.gte ? { gte: range.gte } : {}),
+              ...(range.lte ? { lte: range.lte } : {}),
+            },
+          }
         : {};
-    const [vans, revByVan, expByVan] = await Promise.all([
+    const [vans, revByVan, expByVan, cogsByVan] = await Promise.all([
       this.prisma.van.findMany({ where: { deletedAt: null } }),
       this.prisma.invoice.groupBy({
         by: ['vanId'],
@@ -112,19 +141,42 @@ export class ReportsService {
         where: { deletedAt: null, vanId: { not: null }, ...dateFilter },
         _sum: { amount: true },
       }),
+      this.cogsByVanQuery(range.gte ?? null, range.lte ?? null),
     ]);
     const revMap = new Map(revByVan.map((r) => [r.vanId, r._sum.total ?? 0]));
     const expMap = new Map(expByVan.map((e) => [e.vanId, e._sum.amount ?? 0]));
+    const cogsMap = new Map(cogsByVan.map((c) => [c.vanId, Number(c.cogs)]));
     return vans.map((v) => {
       const revenue = revMap.get(v.id) ?? 0;
+      const cogs = cogsMap.get(v.id) ?? 0;
       const expenses = expMap.get(v.id) ?? 0;
       return {
         vanId: v.id,
         vanName: v.vanName,
         revenue,
+        cogs,
         expenses,
-        netProfit: revenue - expenses,
+        netProfit: revenue - cogs - expenses,
       };
     });
+  }
+
+  /**
+   * True cost of goods sold per van (SALE_ITEM lot allocations, unitCost
+   * snapshot) joined through to invoices in the same date range used for
+   * `revenue` — replaces revenue-minus-expenses-only (no COGS at all).
+   */
+  private cogsByVanQuery(gte: Date | null, lte: Date | null) {
+    return this.prisma.$queryRaw<{ vanId: string | null; cogs: bigint }[]>`
+      SELECT s."vanId" as "vanId", COALESCE(SUM(a.quantity * a."unitCost"), 0)::bigint as cogs
+      FROM stock_lot_allocations a
+      JOIN sale_items si ON si.id = a."consumerId" AND a."consumerType" = 'SALE_ITEM'::"StockLotConsumerType"
+      JOIN sales s ON s.id = si."saleId"
+      JOIN invoices i ON i.id = s."invoiceId"
+      WHERE i."deletedAt" IS NULL
+        AND (${gte}::date IS NULL OR i.date >= ${gte}::date)
+        AND (${lte}::date IS NULL OR i.date <= ${lte}::date)
+      GROUP BY s."vanId"
+    `;
   }
 }

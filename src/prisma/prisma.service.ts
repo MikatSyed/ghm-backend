@@ -6,9 +6,12 @@ const SLOW_QUERY_MS = 200;
 
 function tunePoolUrl(rawUrl: string): string {
   if (!rawUrl) return rawUrl;
+  const isServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
   const sep = rawUrl.includes('?') ? '&' : '?';
   const extras: string[] = [];
-  if (!/[?&]connection_limit=/.test(rawUrl)) extras.push('connection_limit=20');
+  if (!/[?&]connection_limit=/.test(rawUrl)) {
+    extras.push(`connection_limit=${isServerless ? 1 : 20}`);
+  }
   if (!/[?&]pool_timeout=/.test(rawUrl)) extras.push('pool_timeout=10');
   return extras.length ? `${rawUrl}${sep}${extras.join('&')}` : rawUrl;
 }

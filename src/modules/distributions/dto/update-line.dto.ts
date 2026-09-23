@@ -14,7 +14,10 @@ export class UpdateDistributionLineDto {
   @Min(0)
   returned?: number;
 
-  @ApiPropertyOptional({ minimum: 0, description: 'Damaged return — counted as loss/wastage, NOT returned to warehouse' })
+  @ApiPropertyOptional({
+    minimum: 0,
+    description: 'Damaged return — counted as loss/wastage, NOT returned to warehouse',
+  })
   @IsOptional()
   @IsInt()
   @Min(0)

@@ -8,6 +8,7 @@ import {
   AuditAction,
   InvoiceStatus,
   Prisma,
+  SaleType,
   StockLotConsumerType,
   TransactionType,
 } from '@prisma/client';
@@ -17,6 +18,7 @@ import { PrefixIdService } from '../../common/services/prefix-id.service';
 import { StockLotService } from '../../common/services/stock-lot.service';
 import { parseDhakaDateOnly } from '../../common/util/dhaka-time';
 import { PrismaService } from '../../prisma/prisma.service';
+import { CreateDirectSaleDto } from './dto/create-direct-sale.dto';
 import { CreateSaleDto } from './dto/create-sale.dto';
 import { ListSalesQueryDto } from './dto/list-sales.query';
 
@@ -32,182 +34,345 @@ export class SalesService {
     const date = parseDhakaDateOnly(dto.date);
     return this.prisma.$transaction(
       async (tx) => {
-      const van = await tx.van.findFirst({ where: { id: dto.vanId, deletedAt: null } });
-      if (!van) {
-        throw new BadRequestException({ code: 'INVALID_VAN', message: `Van ${dto.vanId} not found` });
-      }
-
-      const productIds = dto.items.map((i) => i.productId);
-      const products = await tx.product.findMany({
-        where: { id: { in: productIds }, deletedAt: null },
-      });
-      const productMap = new Map(products.map((p) => [p.id, p]));
-      for (const it of dto.items) {
-        if (!productMap.has(it.productId)) {
+        const van = await tx.van.findFirst({ where: { id: dto.vanId, deletedAt: null } });
+        if (!van) {
           throw new BadRequestException({
-            code: 'INVALID_PRODUCT',
-            message: `Product ${it.productId} not found`,
+            code: 'INVALID_VAN',
+            message: `Van ${dto.vanId} not found`,
           });
         }
-      }
 
-      // van-side availability check: aggregate DISTRIBUTION_LINE remainingQuantity per product
-      const vanAvailability = await tx.stockLotAllocation.groupBy({
-        by: ['stockEntryId'],
-        where: {
-          consumerType: StockLotConsumerType.DISTRIBUTION_LINE,
-          remainingQuantity: { gt: 0 },
-          stockEntry: { productId: { in: productIds } },
-          consumerId: {
-            in: (
-              await tx.distributionLine.findMany({
-                where: { distribution: { vanId: dto.vanId, deletedAt: null } },
-                select: { id: true },
-              })
-            ).map((l) => l.id),
+        const productIds = dto.items.map((i) => i.productId);
+        const products = await tx.product.findMany({
+          where: { id: { in: productIds }, deletedAt: null },
+        });
+        const productMap = new Map(products.map((p) => [p.id, p]));
+        for (const it of dto.items) {
+          if (!productMap.has(it.productId)) {
+            throw new BadRequestException({
+              code: 'INVALID_PRODUCT',
+              message: `Product ${it.productId} not found`,
+            });
+          }
+        }
+
+        // van-side availability check: aggregate DISTRIBUTION_LINE remainingQuantity per product
+        const vanAvailability = await tx.stockLotAllocation.groupBy({
+          by: ['stockEntryId'],
+          where: {
+            consumerType: StockLotConsumerType.DISTRIBUTION_LINE,
+            remainingQuantity: { gt: 0 },
+            stockEntry: { productId: { in: productIds } },
+            consumerId: {
+              in: (
+                await tx.distributionLine.findMany({
+                  where: { distribution: { vanId: dto.vanId, deletedAt: null } },
+                  select: { id: true },
+                })
+              ).map((l) => l.id),
+            },
           },
-        },
-        _sum: { remainingQuantity: true },
-      });
-      const stockEntries = await tx.stockEntry.findMany({
-        where: { id: { in: vanAvailability.map((v) => v.stockEntryId) } },
-        select: { id: true, productId: true },
-      });
-      const entryToProduct = new Map(stockEntries.map((s) => [s.id, s.productId]));
-      const availableByProduct = new Map<string, number>();
-      for (const row of vanAvailability) {
-        const pid = entryToProduct.get(row.stockEntryId);
-        if (!pid) continue;
-        availableByProduct.set(pid, (availableByProduct.get(pid) ?? 0) + (row._sum.remainingQuantity ?? 0));
-      }
-      const insufficient: string[] = [];
-      const requestedByProduct = new Map<string, number>();
-      for (const it of dto.items) {
-        requestedByProduct.set(it.productId, (requestedByProduct.get(it.productId) ?? 0) + it.qty);
-      }
-      for (const [pid, qty] of requestedByProduct) {
-        if ((availableByProduct.get(pid) ?? 0) < qty) insufficient.push(pid);
-      }
-      if (insufficient.length) throw new InsufficientStockException(insufficient);
+          _sum: { remainingQuantity: true },
+        });
+        const stockEntries = await tx.stockEntry.findMany({
+          where: { id: { in: vanAvailability.map((v) => v.stockEntryId) } },
+          select: { id: true, productId: true },
+        });
+        const entryToProduct = new Map(stockEntries.map((s) => [s.id, s.productId]));
+        const availableByProduct = new Map<string, number>();
+        for (const row of vanAvailability) {
+          const pid = entryToProduct.get(row.stockEntryId);
+          if (!pid) continue;
+          availableByProduct.set(
+            pid,
+            (availableByProduct.get(pid) ?? 0) + (row._sum.remainingQuantity ?? 0),
+          );
+        }
+        const insufficient: string[] = [];
+        const requestedByProduct = new Map<string, number>();
+        for (const it of dto.items) {
+          requestedByProduct.set(
+            it.productId,
+            (requestedByProduct.get(it.productId) ?? 0) + it.qty,
+          );
+        }
+        for (const [pid, qty] of requestedByProduct) {
+          if ((availableByProduct.get(pid) ?? 0) < qty) insufficient.push(pid);
+        }
+        if (insufficient.length) throw new InsufficientStockException(insufficient);
 
-      const total = dto.items.reduce((s, i) => s + i.price * i.qty, 0);
-      const invoiceId = await this.ids.next('INV', 4, tx);
-      const saleId = await this.ids.next('SAL', 3, tx);
+        const total = dto.items.reduce((s, i) => s + i.price * i.qty, 0);
+        const invoiceId = await this.ids.next('INV', 4, tx);
+        const saleId = await this.ids.next('SAL', 3, tx);
 
-      const [invoice, sale] = await Promise.all([
-        tx.invoice.create({
-          data: {
-            id: invoiceId,
-            vanId: dto.vanId,
-            date,
-            total,
-            status: InvoiceStatus.unpaid,
-            items: {
-              create: dto.items.map((it) => {
-                const p = productMap.get(it.productId)!;
-                return {
+        const [invoice, sale] = await Promise.all([
+          tx.invoice.create({
+            data: {
+              id: invoiceId,
+              vanId: dto.vanId,
+              date,
+              total,
+              status: InvoiceStatus.unpaid,
+              items: {
+                create: dto.items.map((it) => {
+                  const p = productMap.get(it.productId)!;
+                  return {
+                    productId: it.productId,
+                    name: p.name,
+                    price: it.price,
+                    qty: it.qty,
+                    subtotal: it.price * it.qty,
+                  };
+                }),
+              },
+            },
+            include: { items: true },
+          }),
+          tx.sale.create({
+            data: {
+              id: saleId,
+              vanId: dto.vanId,
+              date,
+              total,
+              invoiceId,
+              items: {
+                create: dto.items.map((it) => ({
                   productId: it.productId,
-                  name: p.name,
                   price: it.price,
                   qty: it.qty,
-                  subtotal: it.price * it.qty,
-                };
-              }),
+                })),
+              },
             },
-          },
-          include: { items: true },
-        }),
-        tx.sale.create({
+            include: { items: true },
+          }),
+        ]);
+
+        // FIFO-consume van lots per sale item — allocate in parallel, batch insert
+        const allocatedPerItem = await Promise.all(
+          sale.items.map((saleItem) =>
+            this.lots
+              .allocateFromVan(tx, dto.vanId, saleItem.productId, saleItem.qty)
+              .then((slices) => ({ saleItem, slices })),
+          ),
+        );
+        const saleAllocationRows = allocatedPerItem.flatMap(({ saleItem, slices }) =>
+          slices.map((s) => ({
+            stockEntryId: s.stockEntryId,
+            parentAllocationId: s.parentAllocationId,
+            consumerType: StockLotConsumerType.SALE_ITEM,
+            consumerId: saleItem.id,
+            quantity: s.quantity,
+            unitCost: s.unitCost,
+          })),
+        );
+        const cogs = saleAllocationRows.reduce((sum, r) => sum + r.quantity * r.unitCost, 0);
+
+        const uniqueProductIds = Array.from(new Set(sale.items.map((i) => i.productId)));
+        await Promise.all([
+          saleAllocationRows.length
+            ? tx.stockLotAllocation.createMany({ data: saleAllocationRows })
+            : Promise.resolve(),
+          tx.transaction.create({
+            data: {
+              occurredAt: new Date(),
+              amount: total,
+              type: TransactionType.sale,
+              description: `Sale on ${van.vanName} (${dto.items.length} items)`,
+              refTable: 'invoices',
+              refId: invoice.id,
+            },
+          }),
+        ]);
+        await Promise.all(uniqueProductIds.map((pid) => this.lots.recomputeProductStock(tx, pid)));
+
+        await tx.auditLog.create({
           data: {
-            id: saleId,
-            vanId: dto.vanId,
-            date,
-            total,
-            invoiceId,
-            items: {
-              create: dto.items.map((it) => ({
-                productId: it.productId,
-                price: it.price,
-                qty: it.qty,
+            action: AuditAction.CREATE,
+            entity: 'Sale',
+            entityId: sale.id,
+            after: sale as unknown as Prisma.InputJsonValue,
+            meta: {
+              vanId: dto.vanId,
+              date: dto.date,
+              invoiceId: invoice.id,
+              total,
+              cogs,
+              items: sale.items.map((i) => ({
+                productId: i.productId,
+                qty: i.qty,
+                price: i.price,
               })),
+            } as unknown as Prisma.InputJsonValue,
+          },
+        });
+
+        const shaped = this.shapeInvoice({
+          id: invoice.id,
+          date: invoice.date,
+          vanId: dto.vanId,
+          van: { vanName: van.vanName },
+          total: invoice.total,
+          status: invoice.status,
+          items: invoice.items,
+        });
+        return { ...shaped, cogs, profit: total - cogs };
+      },
+      { timeout: 20000, maxWait: 5000 },
+    );
+  }
+
+  /**
+   * Direct warehouse→customer sale: no van involved. Consumes warehouse FIFO
+   * lots straight to SALE_ITEM (same allocation shape distribution-orders'
+   * confirm() uses), invoice + stock reduction happen immediately.
+   */
+  async direct(dto: CreateDirectSaleDto) {
+    const date = parseDhakaDateOnly(dto.date);
+    return this.prisma.$transaction(
+      async (tx) => {
+        const customer = await tx.customer.findFirst({
+          where: { id: dto.customerId, deletedAt: null },
+        });
+        if (!customer) {
+          throw new BadRequestException({
+            code: 'INVALID_CUSTOMER',
+            message: `Customer ${dto.customerId} not found`,
+            fields: { customerId: 'unknown' },
+          });
+        }
+
+        const productIds = dto.items.map((i) => i.productId);
+        const products = await tx.product.findMany({
+          where: { id: { in: productIds }, deletedAt: null },
+        });
+        const productMap = new Map(products.map((p) => [p.id, p]));
+        for (const it of dto.items) {
+          if (!productMap.has(it.productId)) {
+            throw new BadRequestException({
+              code: 'INVALID_PRODUCT',
+              message: `Product ${it.productId} not found`,
+            });
+          }
+        }
+
+        const total = dto.items.reduce((s, i) => s + i.price * i.qty, 0);
+        const invoiceId = await this.ids.next('INV', 4, tx);
+        const saleId = await this.ids.next('SAL', 3, tx);
+
+        const [invoice, sale] = await Promise.all([
+          tx.invoice.create({
+            data: {
+              id: invoiceId,
+              customerId: dto.customerId,
+              date,
+              total,
+              status: InvoiceStatus.unpaid,
+              items: {
+                create: dto.items.map((it) => {
+                  const p = productMap.get(it.productId)!;
+                  return {
+                    productId: it.productId,
+                    name: p.name,
+                    price: it.price,
+                    qty: it.qty,
+                    subtotal: it.price * it.qty,
+                  };
+                }),
+              },
             },
-          },
-          include: { items: true },
-        }),
-      ]);
+            include: { items: true, customer: true },
+          }),
+          tx.sale.create({
+            data: {
+              id: saleId,
+              customerId: dto.customerId,
+              type: SaleType.DIRECT_CUSTOMER,
+              date,
+              total,
+              invoiceId,
+              items: {
+                create: dto.items.map((it) => ({
+                  productId: it.productId,
+                  price: it.price,
+                  qty: it.qty,
+                })),
+              },
+            },
+            include: { items: true },
+          }),
+        ]);
 
-      // FIFO-consume van lots per sale item — allocate in parallel, batch insert
-      const allocatedPerItem = await Promise.all(
-        sale.items.map((saleItem) =>
-          this.lots
-            .allocateFromVan(tx, dto.vanId, saleItem.productId, saleItem.qty)
-            .then((slices) => ({ saleItem, slices })),
-        ),
-      );
-      const saleAllocationRows = allocatedPerItem.flatMap(({ saleItem, slices }) =>
-        slices.map((s) => ({
-          stockEntryId: s.stockEntryId,
-          parentAllocationId: s.parentAllocationId,
-          consumerType: StockLotConsumerType.SALE_ITEM,
-          consumerId: saleItem.id,
-          quantity: s.quantity,
-          unitCost: s.unitCost,
-        })),
-      );
-      const cogs = saleAllocationRows.reduce((sum, r) => sum + r.quantity * r.unitCost, 0);
+        // Warehouse FIFO consumption straight to SALE_ITEM — no van hop.
+        const allocatedPerItem = await Promise.all(
+          sale.items.map((saleItem) =>
+            this.lots
+              .allocateFromWarehouse(tx, saleItem.productId, saleItem.qty)
+              .then((slices) => ({ saleItem, slices })),
+          ),
+        );
+        const saleAllocationRows = allocatedPerItem.flatMap(({ saleItem, slices }) =>
+          slices.map((s) => ({
+            stockEntryId: s.stockEntryId,
+            consumerType: StockLotConsumerType.SALE_ITEM,
+            consumerId: saleItem.id,
+            quantity: s.quantity,
+            unitCost: s.unitCost,
+          })),
+        );
+        const cogs = saleAllocationRows.reduce((sum, r) => sum + r.quantity * r.unitCost, 0);
 
-      const uniqueProductIds = Array.from(new Set(sale.items.map((i) => i.productId)));
-      await Promise.all([
-        saleAllocationRows.length
-          ? tx.stockLotAllocation.createMany({ data: saleAllocationRows })
-          : Promise.resolve(),
-        tx.transaction.create({
+        const uniqueProductIds = Array.from(new Set(sale.items.map((i) => i.productId)));
+        await Promise.all([
+          saleAllocationRows.length
+            ? tx.stockLotAllocation.createMany({ data: saleAllocationRows })
+            : Promise.resolve(),
+          tx.transaction.create({
+            data: {
+              occurredAt: new Date(),
+              amount: total,
+              type: TransactionType.sale,
+              description: `Direct sale to ${customer.name} (${dto.items.length} items)`,
+              refTable: 'invoices',
+              refId: invoice.id,
+            },
+          }),
+        ]);
+        await Promise.all(uniqueProductIds.map((pid) => this.lots.recomputeProductStock(tx, pid)));
+
+        await tx.auditLog.create({
           data: {
-            occurredAt: new Date(),
-            amount: total,
-            type: TransactionType.sale,
-            description: `Sale on ${van.vanName} (${dto.items.length} items)`,
-            refTable: 'invoices',
-            refId: invoice.id,
+            action: AuditAction.CREATE,
+            entity: 'Sale',
+            entityId: sale.id,
+            after: sale as unknown as Prisma.InputJsonValue,
+            meta: {
+              customerId: dto.customerId,
+              date: dto.date,
+              invoiceId: invoice.id,
+              total,
+              cogs,
+              items: sale.items.map((i) => ({
+                productId: i.productId,
+                qty: i.qty,
+                price: i.price,
+              })),
+            } as unknown as Prisma.InputJsonValue,
           },
-        }),
-      ]);
-      await Promise.all(
-        uniqueProductIds.map((pid) => this.lots.recomputeProductStock(tx, pid)),
-      );
+        });
 
-      await tx.auditLog.create({
-        data: {
-          action: AuditAction.CREATE,
-          entity: 'Sale',
-          entityId: sale.id,
-          after: sale as unknown as Prisma.InputJsonValue,
-          meta: {
-            vanId: dto.vanId,
-            date: dto.date,
-            invoiceId: invoice.id,
-            total,
-            cogs,
-            items: sale.items.map((i) => ({
-              productId: i.productId,
-              qty: i.qty,
-              price: i.price,
-            })),
-          } as unknown as Prisma.InputJsonValue,
-        },
-      });
-
-      const shaped = this.shapeInvoice({
-        id: invoice.id,
-        date: invoice.date,
-        vanId: invoice.vanId,
-        van: { vanName: van.vanName },
-        total: invoice.total,
-        status: invoice.status,
-        items: invoice.items,
-      });
-      return { ...shaped, cogs, profit: total - cogs };
-    },
+        return {
+          id: invoice.id,
+          saleId: sale.id,
+          date: invoice.date.toISOString().slice(0, 10),
+          customer: invoice.customer?.name,
+          customerId: invoice.customerId,
+          items: invoice.items.length,
+          total: invoice.total,
+          status: invoice.status,
+          cogs,
+          profit: total - cogs,
+        };
+      },
       { timeout: 20000, maxWait: 5000 },
     );
   }
@@ -293,11 +458,7 @@ export class SalesService {
         // reverse SALE_ITEM allocations — restores qty to parent DISTRIBUTION_LINE
         // (van) or to StockEntry (warehouse fallback if no parent).
         for (const item of sale.items) {
-          await this.lots.reverseAllocationsFor(
-            tx,
-            StockLotConsumerType.SALE_ITEM,
-            item.id,
-          );
+          await this.lots.reverseAllocationsFor(tx, StockLotConsumerType.SALE_ITEM, item.id);
         }
 
         if (sale.invoiceId) {
@@ -350,7 +511,8 @@ export class SalesService {
         items: { include: { product: { select: { name: true, unit: true } } } },
       },
     });
-    if (!sale) throw new NotFoundException({ code: 'NOT_FOUND', message: 'No sales recorded for van' });
+    if (!sale)
+      throw new NotFoundException({ code: 'NOT_FOUND', message: 'No sales recorded for van' });
     return sale;
   }
 

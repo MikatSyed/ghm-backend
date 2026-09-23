@@ -1,6 +1,15 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { AuditAction, StockLocation, StockLotConsumerType } from '@prisma/client';
-import { dhakaDayBoundsUtc, dhakaTodayDateOnly, parseDhakaDateOnly } from '../../common/util/dhaka-time';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { AuditAction, Prisma, StockLocation, StockLotConsumerType } from '@prisma/client';
+import {
+  dhakaDayBoundsUtc,
+  dhakaTodayDateOnly,
+  parseDhakaDateOnly,
+} from '../../common/util/dhaka-time';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateVanDto } from './dto/create-van.dto';
 import { UpdateVanDto } from './dto/update-van.dto';
@@ -14,6 +23,14 @@ export interface VanStockSummaryProduct {
   sold: number;
   damaged: number;
   available: number;
+  soldRevenue: number;
+  soldCost: number;
+  profit: number;
+  profitMargin: number;
+  unitPrice: number | null;
+  // true when today's van allocation for this product was drawn from a
+  // DAMAGED (salvage) lot — the frontend must not fall back to full price.
+  isDamagedStock: boolean;
 }
 
 export interface VanStockSummary {
@@ -165,11 +182,20 @@ export class VansService {
 
   async distributionForDate(vanId: string, date?: string) {
     const day = date ? parseDhakaDateOnly(date) : dhakaTodayDateOnly();
-    const distro = await this.prisma.distribution.findUnique({
-      where: { vanId_date: { vanId, date: day } },
+    // A van can have several distributions on the same date (morning load
+    // plus mid-day top-ups). Flatten their lines into one envelope; envelope
+    // `id` points at the most recent load so "Add Product" appends there.
+    const distros = await this.prisma.distribution.findMany({
+      where: { vanId, date: day, deletedAt: null },
       include: { lines: { include: { product: { select: { name: true, unit: true } } } } },
+      orderBy: { createdAt: 'asc' },
     });
-    return distro ?? { id: null, vanId, date: day.toISOString().slice(0, 10), lines: [] };
+    if (distros.length === 0) {
+      return { id: null, vanId, date: day.toISOString().slice(0, 10), lines: [] };
+    }
+    const lines = distros.flatMap((d) => d.lines);
+    const latest = distros[distros.length - 1];
+    return { id: latest.id, vanId, date: day.toISOString().slice(0, 10), lines };
   }
 
   async stockSummary(vanId: string, date?: string): Promise<VanStockSummary> {
@@ -179,24 +205,30 @@ export class VansService {
     const day = date ? parseDhakaDateOnly(date) : dhakaTodayDateOnly();
     const dayStr = day.toISOString().slice(0, 10);
 
-    const distribution = await this.prisma.distribution.findUnique({
-      where: { vanId_date: { vanId, date: day } },
-      include: { lines: { include: { product: { select: { name: true, unit: true } } } } },
+    const distros = await this.prisma.distribution.findMany({
+      where: { vanId, date: day, deletedAt: null },
+      include: {
+        lines: { include: { product: { select: { name: true, unit: true, tradePrice: true } } } },
+      },
+      orderBy: { createdAt: 'asc' },
     });
+    const distroLines = distros.flatMap((d) => d.lines);
+    const latestDistributionId = distros.length > 0 ? distros[distros.length - 1].id : null;
 
-    if (!distribution || distribution.lines.length === 0) {
+    if (distroLines.length === 0) {
       return {
         vanId,
         date: dayStr,
         van: { vanName: van.vanName, driver: van.driver },
-        distributionId: null,
+        distributionId: latestDistributionId,
         products: [],
         reconciliation: { isBalanced: true, discrepancies: [] },
       };
     }
 
-    const productIds = Array.from(new Set(distribution.lines.map((l) => l.productId)));
-    const [saleAgg, damageAgg] = await Promise.all([
+    const productIds = Array.from(new Set(distroLines.map((l) => l.productId)));
+    const lineIds = distroLines.map((l) => l.id);
+    const [saleAgg, damageAgg, vanLotAllocations, saleFinancialRows] = await Promise.all([
       this.prisma.saleItem.groupBy({
         by: ['productId'],
         where: {
@@ -216,29 +248,89 @@ export class VansService {
         },
         _sum: { quantity: true },
       }),
+      this.prisma.stockLotAllocation.findMany({
+        where: {
+          consumerType: StockLotConsumerType.DISTRIBUTION_LINE,
+          consumerId: { in: lineIds },
+        },
+        include: { stockEntry: { select: { productId: true, condition: true, tradePrice: true } } },
+      }),
+      this.prisma.$queryRaw<
+        { productId: string; soldRevenue: bigint | null; soldCost: bigint | null }[]
+      >`
+        SELECT si."productId" AS "productId",
+          COALESCE(SUM(a.quantity * si.price), 0)::bigint AS "soldRevenue",
+          COALESCE(SUM(a.quantity * a."unitCost"), 0)::bigint AS "soldCost"
+        FROM stock_lot_allocations a
+        JOIN sale_items si ON si.id = a."consumerId" AND a."consumerType" = 'SALE_ITEM'::"StockLotConsumerType"
+        JOIN sales s ON s.id = si."saleId"
+        WHERE s."deletedAt" IS NULL
+          AND s."vanId" = ${vanId}
+          AND s.date = ${day}
+          AND si."productId" IN (${Prisma.join(productIds)})
+        GROUP BY si."productId"
+      `,
     ]);
     const soldByProduct = new Map(saleAgg.map((s) => [s.productId, s._sum.qty ?? 0]));
     const damagedByProduct = new Map(damageAgg.map((d) => [d.productId, d._sum.quantity ?? 0]));
+    const financialByProduct = new Map(
+      saleFinancialRows.map((row) => [
+        row.productId,
+        {
+          soldRevenue: Number(row.soldRevenue ?? 0),
+          soldCost: Number(row.soldCost ?? 0),
+        },
+      ]),
+    );
+
+    // If a van's on-day allocation drew from a DAMAGED lot (i.e. redistributed
+    // salvage stock), surface that lot's reduced tradePrice so the driver never
+    // defaults back to the product's full price when selling it.
+    const damagedPriceByProduct = new Map<string, number | null>();
+    for (const alloc of vanLotAllocations) {
+      if (alloc.stockEntry.condition === 'DAMAGED') {
+        damagedPriceByProduct.set(alloc.stockEntry.productId, alloc.stockEntry.tradePrice);
+      }
+    }
 
     const grouped = new Map<
       string,
-      { allocated: number; returned: number; product: { name: string; unit: string } | null }
+      {
+        allocated: number;
+        returned: number;
+        damageReturned: number;
+        product: { name: string; unit: string; tradePrice: number } | null;
+      }
     >();
-    for (const line of distribution.lines) {
+    for (const line of distroLines) {
       const cur = grouped.get(line.productId) ?? {
         allocated: 0,
         returned: 0,
-        product: line.product ? { name: line.product.name, unit: line.product.unit } : null,
+        damageReturned: 0,
+        product: line.product
+          ? {
+              name: line.product.name,
+              unit: line.product.unit,
+              tradePrice: line.product.tradePrice,
+            }
+          : null,
       };
       cur.allocated += line.allocated;
       cur.returned += line.returned;
+      cur.damageReturned += line.damageReturned;
       grouped.set(line.productId, cur);
     }
 
     const products = Array.from(grouped.entries()).map(([productId, agg]) => {
       const sold = soldByProduct.get(productId) ?? 0;
-      const damaged = damagedByProduct.get(productId) ?? 0;
+      // line.damageReturned covers salvage/wastage taken off distribution lines;
+      // stock adjustments cover van damage recorded outside a distribution.
+      const damaged = (damagedByProduct.get(productId) ?? 0) + agg.damageReturned;
       const available = agg.allocated - agg.returned - sold - damaged;
+      const damagedPrice = damagedPriceByProduct.get(productId);
+      const isDamagedStock = damagedPrice !== undefined;
+      const financial = financialByProduct.get(productId) ?? { soldRevenue: 0, soldCost: 0 };
+      const profit = financial.soldRevenue - financial.soldCost;
       return {
         productId,
         name: agg.product?.name ?? null,
@@ -248,6 +340,15 @@ export class VansService {
         sold,
         damaged,
         available,
+        soldRevenue: financial.soldRevenue,
+        soldCost: financial.soldCost,
+        profit,
+        profitMargin:
+          financial.soldRevenue > 0
+            ? Math.round((profit / financial.soldRevenue) * 10000) / 100
+            : 0,
+        unitPrice: isDamagedStock ? damagedPrice : (agg.product?.tradePrice ?? null),
+        isDamagedStock,
       };
     });
 
@@ -264,7 +365,7 @@ export class VansService {
       vanId,
       date: dayStr,
       van: { vanName: van.vanName, driver: van.driver },
-      distributionId: distribution.id,
+      distributionId: latestDistributionId,
       products,
       reconciliation: {
         isBalanced: discrepancies.length === 0,
@@ -280,12 +381,15 @@ export class VansService {
     const day = date ? parseDhakaDateOnly(date) : dhakaTodayDateOnly();
     const dayStr = day.toISOString().slice(0, 10);
 
-    const distribution = await this.prisma.distribution.findUnique({
-      where: { vanId_date: { vanId, date: day } },
+    const distros = await this.prisma.distribution.findMany({
+      where: { vanId, date: day, deletedAt: null },
       include: { lines: { include: { product: { select: { name: true, unit: true } } } } },
+      orderBy: { createdAt: 'asc' },
     });
+    const allLines = distros.flatMap((d) => d.lines);
+    const latestDistributionId = distros.length > 0 ? distros[distros.length - 1].id : null;
 
-    if (!distribution) {
+    if (distros.length === 0) {
       return {
         vanId,
         date: dayStr,
@@ -295,8 +399,12 @@ export class VansService {
       };
     }
 
-    const lineIds = distribution.lines.map((l) => l.id);
-    const lineMap = new Map(distribution.lines.map((l) => [l.id, l]));
+    const lineIds = allLines.map((l) => l.id);
+    const lineMap = new Map(allLines.map((l) => [l.id, l]));
+    // Map each line id back to the parent distribution's createdAt so the
+    // ALLOCATION event for top-ups carries the correct timestamp.
+    const lineToDistroCreatedAt = new Map<string, Date>();
+    for (const d of distros) for (const l of d.lines) lineToDistroCreatedAt.set(l.id, d.createdAt);
 
     const [sales, adjustments, lineAudits] = await Promise.all([
       this.prisma.sale.findMany({
@@ -341,11 +449,11 @@ export class VansService {
 
     const events: Event[] = [];
 
-    for (const line of distribution.lines) {
+    for (const line of allLines) {
       if (line.allocated <= 0) continue;
       events.push({
         id: `ALLOC-${line.id}`,
-        occurredAt: distribution.createdAt,
+        occurredAt: lineToDistroCreatedAt.get(line.id) ?? new Date(),
         type: 'ALLOCATION',
         productId: line.productId,
         productName: line.product?.name ?? null,
@@ -389,21 +497,45 @@ export class VansService {
     }
 
     for (const audit of lineAudits) {
-      const meta = (audit.meta ?? {}) as { returnedDelta?: number; productId?: string };
-      const returnedDelta = meta.returnedDelta ?? 0;
-      if (returnedDelta <= 0) continue;
+      const meta = (audit.meta ?? {}) as {
+        returnedDelta?: number;
+        damageDelta?: number;
+        salvage?: boolean;
+        salvagePrice?: number;
+        productId?: string;
+      };
       const line = lineMap.get(audit.entityId);
-      events.push({
-        id: `RET-${audit.id}`,
-        occurredAt: audit.occurredAt,
-        type: 'RETURN',
-        productId: line?.productId ?? meta.productId ?? '',
-        productName: line?.product?.name ?? null,
-        productUnit: line?.product?.unit ?? null,
-        quantity: returnedDelta,
-        notes: null,
-        distributionLineId: audit.entityId,
-      });
+      const returnedDelta = meta.returnedDelta ?? 0;
+      if (returnedDelta > 0) {
+        events.push({
+          id: `RET-${audit.id}`,
+          occurredAt: audit.occurredAt,
+          type: 'RETURN',
+          productId: line?.productId ?? meta.productId ?? '',
+          productName: line?.product?.name ?? null,
+          productUnit: line?.product?.unit ?? null,
+          quantity: returnedDelta,
+          notes: null,
+          distributionLineId: audit.entityId,
+        });
+      }
+      // salvage = damaged goods re-entered as a reduced-price DAMAGED lot;
+      // a plain damageDelta burn is wastage (total loss)
+      const damageDelta = meta.damageDelta ?? 0;
+      if (damageDelta > 0) {
+        events.push({
+          id: `DMG-${audit.id}`,
+          occurredAt: audit.occurredAt,
+          type: meta.salvage ? 'DAMAGE' : 'WASTAGE',
+          productId: line?.productId ?? meta.productId ?? '',
+          productName: line?.product?.name ?? null,
+          productUnit: line?.product?.unit ?? null,
+          quantity: damageDelta,
+          notes: null,
+          distributionLineId: audit.entityId,
+          price: meta.salvage ? meta.salvagePrice : undefined,
+        });
+      }
     }
 
     events.sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
@@ -412,7 +544,7 @@ export class VansService {
       vanId,
       date: dayStr,
       van: { vanName: van.vanName, driver: van.driver },
-      distributionId: distribution.id,
+      distributionId: latestDistributionId,
       events,
     };
   }

@@ -69,7 +69,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
 
       const messages = Array.isArray(obj.message) ? obj.message : undefined;
       const fields = obj.fields ?? this.fieldsFromValidationMessages(messages);
-      const message = Array.isArray(obj.message) ? obj.message.join('; ') : obj.message ?? exception.message;
+      const message = Array.isArray(obj.message)
+        ? obj.message.join('; ')
+        : (obj.message ?? exception.message);
 
       return {
         status,
@@ -103,7 +105,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
     if (exception instanceof Error) {
       return {
         status: HttpStatus.INTERNAL_SERVER_ERROR,
-        body: { error: { code: 'INTERNAL_ERROR', message: exception.message || 'Unexpected error' } },
+        body: {
+          error: { code: 'INTERNAL_ERROR', message: exception.message || 'Unexpected error' },
+        },
       };
     }
 
@@ -113,7 +117,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
     };
   }
 
-  private fromPrismaKnown(e: Prisma.PrismaClientKnownRequestError): { status: number; body: ErrorBody } {
+  private fromPrismaKnown(e: Prisma.PrismaClientKnownRequestError): {
+    status: number;
+    body: ErrorBody;
+  } {
     switch (e.code) {
       case 'P2002': {
         const target = (e.meta?.target as string[] | undefined)?.join(', ') ?? 'field';

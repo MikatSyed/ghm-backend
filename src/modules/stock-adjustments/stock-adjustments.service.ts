@@ -50,183 +50,180 @@ export class StockAdjustmentsService {
 
     return this.prisma.$transaction(
       async (tx) => {
-      const product = await tx.product.findFirst({
-        where: { id: dto.productId, deletedAt: null },
-      });
-      if (!product) {
-        throw new BadRequestException({
-          code: 'INVALID_PRODUCT',
-          message: `Product ${dto.productId} not found`,
-          fields: { productId: 'unknown' },
+        const product = await tx.product.findFirst({
+          where: { id: dto.productId, deletedAt: null },
         });
-      }
-
-      if (dto.vanId) {
-        const van = await tx.van.findFirst({ where: { id: dto.vanId, deletedAt: null } });
-        if (!van) {
+        if (!product) {
           throw new BadRequestException({
-            code: 'INVALID_VAN',
-            message: `Van ${dto.vanId} not found`,
-            fields: { vanId: 'unknown' },
+            code: 'INVALID_PRODUCT',
+            message: `Product ${dto.productId} not found`,
+            fields: { productId: 'unknown' },
           });
         }
-      }
 
-      const id = await this.ids.next('ADJ', 3, tx);
-      const adjustment = await tx.stockAdjustment.create({
-        data: {
-          id,
-          date,
-          productId: dto.productId,
-          quantity: dto.quantity,
-          reason: dto.reason,
-          location: dto.location,
-          vanId: dto.vanId,
-          notes: dto.notes,
-        },
-      });
-
-      // Adjustments (DAMAGE/WASTAGE/CORRECTION) must be able to write off
-      // expired stock, so allow consuming expired lots here.
-      let allocationRows: Array<{
-        stockEntryId: string;
-        parentAllocationId?: string;
-        consumerType: StockLotConsumerType;
-        consumerId: string;
-        quantity: number;
-        unitCost: number;
-      }>;
-
-      if (dto.stockEntryId) {
-        // Targeted single-lot path: validate the lot belongs to this product.
-        const lot = await tx.stockEntry.findFirst({
-          where: { id: dto.stockEntryId, productId: dto.productId, deletedAt: null },
-          select: { id: true, remainingQuantity: true, buyingRate: true },
-        });
-        if (!lot) {
-          throw new BadRequestException({
-            code: 'INVALID_STOCK_ENTRY',
-            message: `Stock entry ${dto.stockEntryId} not found for product ${dto.productId}`,
-            fields: { stockEntryId: 'unknown' },
-          });
+        if (dto.vanId) {
+          const van = await tx.van.findFirst({ where: { id: dto.vanId, deletedAt: null } });
+          if (!van) {
+            throw new BadRequestException({
+              code: 'INVALID_VAN',
+              message: `Van ${dto.vanId} not found`,
+              fields: { vanId: 'unknown' },
+            });
+          }
         }
-        if (lot.remainingQuantity < dto.quantity) {
-          throw new BadRequestException({
-            code: 'INSUFFICIENT_STOCK',
-            message: `Stock entry ${dto.stockEntryId} has only ${lot.remainingQuantity} remaining, requested ${dto.quantity}`,
-            fields: { quantity: 'exceeds_remaining' },
-          });
-        }
-        await tx.stockEntry.update({
-          where: { id: dto.stockEntryId },
-          data: { remainingQuantity: { decrement: dto.quantity } },
+
+        const id = await this.ids.next('ADJ', 3, tx);
+        const adjustment = await tx.stockAdjustment.create({
+          data: {
+            id,
+            date,
+            productId: dto.productId,
+            quantity: dto.quantity,
+            reason: dto.reason,
+            location: dto.location,
+            vanId: dto.vanId,
+            notes: dto.notes,
+          },
         });
-        allocationRows = [
-          {
-            stockEntryId: lot.id,
+
+        // Adjustments (DAMAGE/WASTAGE/CORRECTION) must be able to write off
+        // expired stock, so allow consuming expired lots here.
+        let allocationRows: Array<{
+          stockEntryId: string;
+          parentAllocationId?: string;
+          consumerType: StockLotConsumerType;
+          consumerId: string;
+          quantity: number;
+          unitCost: number;
+        }>;
+
+        if (dto.stockEntryId) {
+          // Targeted single-lot path: validate the lot belongs to this product.
+          const lot = await tx.stockEntry.findFirst({
+            where: { id: dto.stockEntryId, productId: dto.productId, deletedAt: null },
+            select: { id: true, remainingQuantity: true, basePrice: true },
+          });
+          if (!lot) {
+            throw new BadRequestException({
+              code: 'INVALID_STOCK_ENTRY',
+              message: `Stock entry ${dto.stockEntryId} not found for product ${dto.productId}`,
+              fields: { stockEntryId: 'unknown' },
+            });
+          }
+          if (lot.remainingQuantity < dto.quantity) {
+            throw new BadRequestException({
+              code: 'INSUFFICIENT_STOCK',
+              message: `Stock entry ${dto.stockEntryId} has only ${lot.remainingQuantity} remaining, requested ${dto.quantity}`,
+              fields: { quantity: 'exceeds_remaining' },
+            });
+          }
+          await tx.stockEntry.update({
+            where: { id: dto.stockEntryId },
+            data: { remainingQuantity: { decrement: dto.quantity } },
+          });
+          allocationRows = [
+            {
+              stockEntryId: lot.id,
+              consumerType: StockLotConsumerType.STOCK_ADJUSTMENT,
+              consumerId: adjustment.id,
+              quantity: dto.quantity,
+              unitCost: lot.basePrice,
+            },
+          ];
+        } else if (dto.location === StockLocation.WAREHOUSE) {
+          const slices = await this.lots.allocateFromWarehouse(tx, dto.productId, dto.quantity, {
+            includeExpired: true,
+          });
+          allocationRows = slices.map((s) => ({
+            stockEntryId: s.stockEntryId,
             consumerType: StockLotConsumerType.STOCK_ADJUSTMENT,
             consumerId: adjustment.id,
-            quantity: dto.quantity,
-            unitCost: lot.buyingRate,
+            quantity: s.quantity,
+            unitCost: s.unitCost,
+          }));
+        } else {
+          const slices = await this.lots.allocateFromVan(
+            tx,
+            dto.vanId!,
+            dto.productId,
+            dto.quantity,
+            { includeExpired: true },
+          );
+          allocationRows = slices.map((s) => ({
+            stockEntryId: s.stockEntryId,
+            parentAllocationId: s.parentAllocationId,
+            consumerType: StockLotConsumerType.STOCK_ADJUSTMENT,
+            consumerId: adjustment.id,
+            quantity: s.quantity,
+            unitCost: s.unitCost,
+          }));
+        }
+
+        if (allocationRows.length > 0) {
+          await tx.stockLotAllocation.createMany({ data: allocationRows });
+        }
+        const costAmount = allocationRows.reduce((sum, r) => sum + r.quantity * r.unitCost, 0);
+
+        await this.lots.recomputeProductStock(tx, dto.productId);
+
+        await tx.transaction.create({
+          data: {
+            occurredAt: new Date(),
+            amount: costAmount,
+            type: TransactionType.stock,
+            description: `Adjustment (${dto.reason.toLowerCase()} @ ${dto.location.toLowerCase()}): ${product.name} −${dto.quantity} ${product.unit}`,
+            refTable: 'stock_adjustments',
+            refId: adjustment.id,
           },
-        ];
-      } else if (dto.location === StockLocation.WAREHOUSE) {
-        const slices = await this.lots.allocateFromWarehouse(
-          tx,
-          dto.productId,
-          dto.quantity,
-          { includeExpired: true },
-        );
-        allocationRows = slices.map((s) => ({
-          stockEntryId: s.stockEntryId,
-          consumerType: StockLotConsumerType.STOCK_ADJUSTMENT,
-          consumerId: adjustment.id,
-          quantity: s.quantity,
-          unitCost: s.unitCost,
-        }));
-      } else {
-        const slices = await this.lots.allocateFromVan(
-          tx,
-          dto.vanId!,
-          dto.productId,
-          dto.quantity,
-          { includeExpired: true },
-        );
-        allocationRows = slices.map((s) => ({
-          stockEntryId: s.stockEntryId,
-          parentAllocationId: s.parentAllocationId,
-          consumerType: StockLotConsumerType.STOCK_ADJUSTMENT,
-          consumerId: adjustment.id,
-          quantity: s.quantity,
-          unitCost: s.unitCost,
-        }));
-      }
+        });
 
-      if (allocationRows.length > 0) {
-        await tx.stockLotAllocation.createMany({ data: allocationRows });
-      }
-      const costAmount = allocationRows.reduce((sum, r) => sum + r.quantity * r.unitCost, 0);
+        await tx.auditLog.create({
+          data: {
+            action: AuditAction.CREATE,
+            entity: 'StockAdjustment',
+            entityId: adjustment.id,
+            after: adjustment as unknown as Prisma.InputJsonValue,
+            meta: {
+              allocations: allocationRows.map((r) => ({
+                stockEntryId: r.stockEntryId,
+                quantity: r.quantity,
+                unitCost: r.unitCost,
+              })),
+              costAmount,
+            } as unknown as Prisma.InputJsonValue,
+          },
+        });
 
-      await this.lots.recomputeProductStock(tx, dto.productId);
+        const touchedEntryIds = Array.from(new Set(allocationRows.map((r) => r.stockEntryId)));
+        const [touchedEntries, updatedProduct] = await Promise.all([
+          touchedEntryIds.length
+            ? tx.stockEntry.findMany({
+                where: { id: { in: touchedEntryIds } },
+                select: { id: true, remainingQuantity: true, expiryDate: true },
+              })
+            : Promise.resolve([]),
+          tx.product.findUnique({
+            where: { id: dto.productId },
+            select: { stock: true },
+          }),
+        ]);
+        const entryMap = new Map(touchedEntries.map((e) => [e.id, e]));
 
-      await tx.transaction.create({
-        data: {
-          occurredAt: new Date(),
-          amount: costAmount,
-          type: TransactionType.stock,
-          description: `Adjustment (${dto.reason.toLowerCase()} @ ${dto.location.toLowerCase()}): ${product.name} −${dto.quantity} ${product.unit}`,
-          refTable: 'stock_adjustments',
-          refId: adjustment.id,
-        },
-      });
-
-      await tx.auditLog.create({
-        data: {
-          action: AuditAction.CREATE,
-          entity: 'StockAdjustment',
-          entityId: adjustment.id,
-          after: adjustment as unknown as Prisma.InputJsonValue,
-          meta: {
-            allocations: allocationRows.map((r) => ({
+        return {
+          ...adjustment,
+          productStock: updatedProduct?.stock ?? 0,
+          lots: allocationRows.map((r) => {
+            const entry = entryMap.get(r.stockEntryId);
+            return {
               stockEntryId: r.stockEntryId,
               quantity: r.quantity,
               unitCost: r.unitCost,
-            })),
-            costAmount,
-          } as unknown as Prisma.InputJsonValue,
-        },
-      });
-
-      const touchedEntryIds = Array.from(new Set(allocationRows.map((r) => r.stockEntryId)));
-      const [touchedEntries, updatedProduct] = await Promise.all([
-        touchedEntryIds.length
-          ? tx.stockEntry.findMany({
-              where: { id: { in: touchedEntryIds } },
-              select: { id: true, remainingQuantity: true, expiryDate: true },
-            })
-          : Promise.resolve([]),
-        tx.product.findUnique({
-          where: { id: dto.productId },
-          select: { stock: true },
-        }),
-      ]);
-      const entryMap = new Map(touchedEntries.map((e) => [e.id, e]));
-
-      return {
-        ...adjustment,
-        productStock: updatedProduct?.stock ?? 0,
-        lots: allocationRows.map((r) => {
-          const entry = entryMap.get(r.stockEntryId);
-          return {
-            stockEntryId: r.stockEntryId,
-            quantity: r.quantity,
-            unitCost: r.unitCost,
-            remainingQuantity: entry?.remainingQuantity ?? null,
-            expiryDate: entry?.expiryDate ?? null,
-          };
-        }),
-      };
-    },
+              remainingQuantity: entry?.remainingQuantity ?? null,
+              expiryDate: entry?.expiryDate ?? null,
+            };
+          }),
+        };
+      },
       { timeout: 20000, maxWait: 5000 },
     );
   }
@@ -298,7 +295,7 @@ export class StockAdjustmentsService {
             expiryDate: true,
             quantity: true,
             remainingQuantity: true,
-            buyingRate: true,
+            basePrice: true,
             source: true,
             productId: true,
             product: { select: { id: true, name: true, unit: true } },
@@ -331,7 +328,7 @@ export class StockAdjustmentsService {
         expiryDate: Date | null;
         originalQuantity: number;
         remainingQuantity: number;
-        buyingRate: number;
+        basePrice: number;
         source: string;
       };
       totalAdjusted: number;
@@ -361,7 +358,7 @@ export class StockAdjustmentsService {
             expiryDate: a.stockEntry.expiryDate,
             originalQuantity: a.stockEntry.quantity,
             remainingQuantity: a.stockEntry.remainingQuantity,
-            buyingRate: a.stockEntry.buyingRate,
+            basePrice: a.stockEntry.basePrice,
             source: a.stockEntry.source,
           },
           totalAdjusted: 0,
@@ -386,9 +383,7 @@ export class StockAdjustmentsService {
     for (const bucket of byLot.values()) {
       bucket.adjustments.sort((a, b) => b.date.getTime() - a.date.getTime());
     }
-    return Array.from(byLot.values()).sort((a, b) =>
-      a.stockEntryId < b.stockEntryId ? -1 : 1,
-    );
+    return Array.from(byLot.values()).sort((a, b) => (a.stockEntryId < b.stockEntryId ? -1 : 1));
   }
 
   async findOne(id: string) {
@@ -404,7 +399,7 @@ export class StockAdjustmentsService {
     }
     const allocations = await this.prisma.stockLotAllocation.findMany({
       where: { consumerType: StockLotConsumerType.STOCK_ADJUSTMENT, consumerId: id },
-      include: { stockEntry: { select: { id: true, source: true, buyingRate: true } } },
+      include: { stockEntry: { select: { id: true, source: true, basePrice: true } } },
       orderBy: { createdAt: 'asc' },
     });
     return { ...a, lots: allocations };
@@ -413,29 +408,29 @@ export class StockAdjustmentsService {
   async remove(id: string) {
     return this.prisma.$transaction(
       async (tx) => {
-      const a = await tx.stockAdjustment.findFirst({ where: { id, deletedAt: null } });
-      if (!a) {
-        throw new NotFoundException({
-          code: 'NOT_FOUND',
-          message: `Stock adjustment ${id} not found`,
+        const a = await tx.stockAdjustment.findFirst({ where: { id, deletedAt: null } });
+        if (!a) {
+          throw new NotFoundException({
+            code: 'NOT_FOUND',
+            message: `Stock adjustment ${id} not found`,
+          });
+        }
+        await this.lots.reverseAllocationsFor(tx, StockLotConsumerType.STOCK_ADJUSTMENT, id);
+        await tx.stockAdjustment.update({
+          where: { id },
+          data: { deletedAt: new Date() },
         });
-      }
-      await this.lots.reverseAllocationsFor(tx, StockLotConsumerType.STOCK_ADJUSTMENT, id);
-      await tx.stockAdjustment.update({
-        where: { id },
-        data: { deletedAt: new Date() },
-      });
-      await this.lots.recomputeProductStock(tx, a.productId);
-      await tx.auditLog.create({
-        data: {
-          action: AuditAction.DELETE,
-          entity: 'StockAdjustment',
-          entityId: id,
-          before: a as unknown as Prisma.InputJsonValue,
-        },
-      });
-      return { id, deleted: true };
-    },
+        await this.lots.recomputeProductStock(tx, a.productId);
+        await tx.auditLog.create({
+          data: {
+            action: AuditAction.DELETE,
+            entity: 'StockAdjustment',
+            entityId: id,
+            before: a as unknown as Prisma.InputJsonValue,
+          },
+        });
+        return { id, deleted: true };
+      },
       { timeout: 20000, maxWait: 5000 },
     );
   }
@@ -478,7 +473,7 @@ export class StockAdjustmentsService {
               date: true,
               source: true,
               expiryDate: true,
-              buyingRate: true,
+              basePrice: true,
             },
           },
         },

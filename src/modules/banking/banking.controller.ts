@@ -86,10 +86,7 @@ export class BankingController {
   @Delete('accounts/:id/transactions/:txId')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete a transaction and reverse its balance effect' })
-  async deleteTransaction(
-    @Param('id') id: string,
-    @Param('txId') txId: string,
-  ): Promise<void> {
+  async deleteTransaction(@Param('id') id: string, @Param('txId') txId: string): Promise<void> {
     await this.service.deleteTransaction(id, txId);
   }
 }

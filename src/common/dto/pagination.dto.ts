@@ -36,17 +36,26 @@ export class PaginationQueryDto {
     return this.pageSize;
   }
 
-  parseSort(allowed: readonly string[]): Record<string, 'asc' | 'desc'> | undefined {
+  // Prisma requires multi-field orderBy as an array of single-key objects;
+  // a single object holding several keys fails query validation.
+  // The non-array union member only exists so `?? { date: 'desc' }` fallbacks
+  // at call sites keep their literal types.
+  parseSort(
+    allowed: readonly string[],
+  ): Record<string, 'asc' | 'desc'>[] | Record<string, 'asc' | 'desc'> | undefined {
     if (!this.sort) return undefined;
-    const order: Record<string, 'asc' | 'desc'> = {};
-    for (const raw of this.sort.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const order: Record<string, 'asc' | 'desc'>[] = [];
+    for (const raw of this.sort
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)) {
       const desc = raw.startsWith('-');
       const field = desc ? raw.slice(1) : raw;
       if (allowed.includes(field)) {
-        order[field] = desc ? 'desc' : 'asc';
+        order.push({ [field]: desc ? 'desc' : 'asc' });
       }
     }
-    return Object.keys(order).length ? order : undefined;
+    return order.length ? order : undefined;
   }
 }
 

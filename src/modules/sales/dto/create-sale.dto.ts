@@ -1,6 +1,14 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { ArrayMinSize, IsArray, IsDateString, IsInt, IsString, Min, ValidateNested } from 'class-validator';
+import {
+  ArrayMinSize,
+  IsArray,
+  IsDateString,
+  IsInt,
+  IsString,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 
 export class SaleItemDto {
   @ApiProperty({ example: 'PRD-001' })

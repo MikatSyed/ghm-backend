@@ -19,7 +19,7 @@ export class DashboardService {
   async metrics() {
     const { startUtc, endUtc } = dhakaDayBoundsUtc();
     const today = dhakaTodayDateOnly();
-    const [revenueAgg, expenseAgg, stockAgg, lowStock, todayInvoices] = await Promise.all([
+    const [revenueAgg, expenseAgg, stockAgg, lowStock, todayInvoices, cogsRow] = await Promise.all([
       this.prisma.invoice.aggregate({
         where: { deletedAt: null, createdAt: { gte: startUtc, lt: endUtc } },
         _sum: { total: true },
@@ -38,13 +38,16 @@ export class DashboardService {
       this.prisma.invoice.count({
         where: { deletedAt: null, createdAt: { gte: startUtc, lt: endUtc } },
       }),
+      this.cogsQuery(startUtc, endUtc),
     ]);
     const revenue = revenueAgg._sum.total ?? 0;
     const expenses = expenseAgg._sum.amount ?? 0;
+    const cogs = Number(cogsRow[0]?.cogs ?? 0);
     return {
       todayRevenue: revenue,
+      todayCogs: cogs,
       todayExpenses: expenses,
-      todayProfit: revenue - expenses,
+      todayProfit: revenue - cogs - expenses,
       todayInvoices,
       stockOnHand: stockAgg._sum.stock ?? 0,
       lowStockCount: lowStock,
@@ -55,7 +58,7 @@ export class DashboardService {
     const { startUtc, endUtc } = dhakaRangeUtc(timeframe);
     const startDateOnly = this.toUtcDateOnly(startUtc);
     const endDateOnly = this.toUtcDateOnly(endUtc);
-    const [invoices, expenses, stockEntries] = await Promise.all([
+    const [invoices, expenses, stockEntries, cogsRows] = await Promise.all([
       this.prisma.invoice.findMany({
         where: { deletedAt: null, createdAt: { gte: startUtc, lt: endUtc } },
         select: { total: true, createdAt: true, items: { select: { qty: true } } },
@@ -66,11 +69,15 @@ export class DashboardService {
       }),
       this.prisma.stockEntry.findMany({
         where: { deletedAt: null, date: { gte: startDateOnly, lte: endDateOnly } },
-        select: { quantity: true, buyingRate: true, date: true },
+        select: { quantity: true, date: true },
       }),
+      this.cogsRowsQuery(startUtc, endUtc),
     ]);
 
-    const bucket: Record<string, { revenue: number; cost: number; expense: number; stock: number }> = {};
+    const bucket: Record<
+      string,
+      { revenue: number; cost: number; expense: number; stock: number }
+    > = {};
     const fmt = this.bucketFormat(timeframe);
 
     for (const inv of invoices) {
@@ -86,8 +93,12 @@ export class DashboardService {
     for (const s of stockEntries) {
       const k = format(toZonedTime(s.date, DHAKA_TZ), fmt);
       bucket[k] ??= { revenue: 0, cost: 0, expense: 0, stock: 0 };
-      bucket[k].cost += s.quantity * s.buyingRate;
       bucket[k].stock += s.quantity;
+    }
+    for (const r of cogsRows) {
+      const k = format(toZonedTime(r.createdAt, DHAKA_TZ), fmt);
+      bucket[k] ??= { revenue: 0, cost: 0, expense: 0, stock: 0 };
+      bucket[k].cost += r.quantity * r.unitCost;
     }
 
     return Object.entries(bucket)
@@ -99,6 +110,37 @@ export class DashboardService {
         profit: v.revenue - v.cost - v.expense,
         stock: v.stock,
       }));
+  }
+
+  /**
+   * True cost of goods sold for [start, end): SALE_ITEM lot allocations
+   * (unitCost snapshot) joined through to invoices created in that range —
+   * replaces the old "stock purchased in the period" proxy.
+   */
+  private cogsQuery(start: Date, end: Date) {
+    return this.prisma.$queryRaw<{ cogs: bigint | null }[]>`
+      SELECT COALESCE(SUM(a.quantity * a."unitCost"), 0)::bigint as cogs
+      FROM stock_lot_allocations a
+      JOIN sale_items si ON si.id = a."consumerId" AND a."consumerType" = 'SALE_ITEM'::"StockLotConsumerType"
+      JOIN sales s ON s.id = si."saleId"
+      JOIN invoices i ON i.id = s."invoiceId"
+      WHERE i."deletedAt" IS NULL
+        AND i."createdAt" >= ${start}
+        AND i."createdAt" < ${end}
+    `;
+  }
+
+  private cogsRowsQuery(start: Date, end: Date) {
+    return this.prisma.$queryRaw<{ quantity: number; unitCost: number; createdAt: Date }[]>`
+      SELECT a.quantity as quantity, a."unitCost" as "unitCost", i."createdAt" as "createdAt"
+      FROM stock_lot_allocations a
+      JOIN sale_items si ON si.id = a."consumerId" AND a."consumerType" = 'SALE_ITEM'::"StockLotConsumerType"
+      JOIN sales s ON s.id = si."saleId"
+      JOIN invoices i ON i.id = s."invoiceId"
+      WHERE i."deletedAt" IS NULL
+        AND i."createdAt" >= ${start}
+        AND i."createdAt" < ${end}
+    `;
   }
 
   private toUtcDateOnly(utcInstant: Date): Date {

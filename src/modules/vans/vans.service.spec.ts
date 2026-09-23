@@ -9,14 +9,17 @@ describe('VansService.stockSummary', () => {
     distribution?: {
       id: string;
       lines: Array<{
+        id: string;
         productId: string;
         allocated: number;
         returned: number;
-        product: { name: string; unit: string };
+        damageReturned: number;
+        product: { name: string; unit: string; tradePrice: number };
       }>;
     } | null;
     saleAgg?: Array<{ productId: string; _sum: { qty: number | null } }>;
     damageAgg?: Array<{ productId: string; _sum: { quantity: number | null } }>;
+    saleFinancialRows?: Array<{ productId: string; soldRevenue: bigint; soldCost: bigint }>;
   }) {
     const prisma = {
       van: {
@@ -24,6 +27,7 @@ describe('VansService.stockSummary', () => {
       },
       distribution: {
         findUnique: () => Promise.resolve(opts.distribution ?? null),
+        findMany: () => Promise.resolve(opts.distribution ? [opts.distribution] : []),
       },
       saleItem: {
         groupBy: () => Promise.resolve(opts.saleAgg ?? []),
@@ -31,6 +35,10 @@ describe('VansService.stockSummary', () => {
       stockAdjustment: {
         groupBy: () => Promise.resolve(opts.damageAgg ?? []),
       },
+      stockLotAllocation: {
+        findMany: () => Promise.resolve([]),
+      },
+      $queryRaw: () => Promise.resolve(opts.saleFinancialRows ?? []),
     } as unknown as PrismaService;
     return prisma;
   }
@@ -60,16 +68,20 @@ describe('VansService.stockSummary', () => {
         id: 'DST-001',
         lines: [
           {
+            id: 'line-1',
             productId: 'PRD-001',
             allocated: 20,
             returned: 0,
-            product: { name: 'Rice', unit: 'kg' },
+            damageReturned: 0,
+            product: { name: 'Rice', unit: 'kg', tradePrice: 100 },
           },
           {
+            id: 'line-2',
             productId: 'PRD-002',
             allocated: 50,
             returned: 5,
-            product: { name: 'Sugar', unit: 'kg' },
+            damageReturned: 0,
+            product: { name: 'Sugar', unit: 'kg', tradePrice: 120 },
           },
         ],
       },
@@ -101,6 +113,34 @@ describe('VansService.stockSummary', () => {
     assert.equal(out.reconciliation.discrepancies.length, 0);
   });
 
+  it('adds per-product sale revenue, cost, profit and margin', async () => {
+    const prisma = makePrismaMock({
+      van: { id: 'V1', vanName: 'Truck A', driver: 'Karim' },
+      distribution: {
+        id: 'DST-001',
+        lines: [
+          {
+            id: 'line-1',
+            productId: 'PRD-001',
+            allocated: 20,
+            returned: 0,
+            damageReturned: 0,
+            product: { name: 'Rice', unit: 'kg', tradePrice: 100 },
+          },
+        ],
+      },
+      saleAgg: [{ productId: 'PRD-001', _sum: { qty: 12 } }],
+      saleFinancialRows: [{ productId: 'PRD-001', soldRevenue: 1200n, soldCost: 720n }],
+    });
+    const svc = new VansService(prisma);
+    const out = await svc.stockSummary('V1', '2026-04-29');
+
+    assert.equal(out.products[0].soldRevenue, 1200);
+    assert.equal(out.products[0].soldCost, 720);
+    assert.equal(out.products[0].profit, 480);
+    assert.equal(out.products[0].profitMargin, 40);
+  });
+
   it('flags discrepancy when consumption exceeds allocated (over-sell)', async () => {
     const prisma = makePrismaMock({
       van: { id: 'V1', vanName: 'Truck A', driver: 'Karim' },
@@ -108,10 +148,12 @@ describe('VansService.stockSummary', () => {
         id: 'DST-001',
         lines: [
           {
+            id: 'line-1',
             productId: 'PRD-001',
             allocated: 10,
             returned: 0,
-            product: { name: 'Rice', unit: 'kg' },
+            damageReturned: 0,
+            product: { name: 'Rice', unit: 'kg', tradePrice: 100 },
           },
         ],
       },
@@ -135,16 +177,20 @@ describe('VansService.stockSummary', () => {
         id: 'DST-001',
         lines: [
           {
+            id: 'line-1',
             productId: 'PRD-001',
             allocated: 10,
             returned: 1,
-            product: { name: 'Rice', unit: 'kg' },
+            damageReturned: 0,
+            product: { name: 'Rice', unit: 'kg', tradePrice: 100 },
           },
           {
+            id: 'line-2',
             productId: 'PRD-001',
             allocated: 5,
             returned: 0,
-            product: { name: 'Rice', unit: 'kg' },
+            damageReturned: 0,
+            product: { name: 'Rice', unit: 'kg', tradePrice: 100 },
           },
         ],
       },

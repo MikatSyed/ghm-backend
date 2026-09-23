@@ -15,10 +15,10 @@ export class CreateStockEntryDto {
   @Min(1)
   quantity!: number;
 
-  @ApiProperty({ minimum: 0 })
+  @ApiProperty({ minimum: 0, description: 'Base Price — landed unit cost (BDT)' })
   @IsInt()
   @Min(0)
-  buyingRate!: number;
+  basePrice!: number;
 
   @ApiProperty()
   @IsString()
@@ -29,6 +29,11 @@ export class CreateStockEntryDto {
   @IsOptional()
   @IsDateString()
   expiryDate?: string;
+
+  @ApiPropertyOptional({ example: 'BAT-007', description: 'Existing batch this entry belongs to' })
+  @IsOptional()
+  @IsString()
+  batchId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
